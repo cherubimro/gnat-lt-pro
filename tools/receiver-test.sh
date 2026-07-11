@@ -14,7 +14,7 @@ cd "$here/.."
 SIZE="${1:-25000000}"
 PORT="${2:-9400}"
 SEED="${3:-7}"
-PACE=40
+PACE=15
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 

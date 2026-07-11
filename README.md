@@ -13,8 +13,9 @@ core written in the **SPARK** subset and proved free of run-time errors by `gnat
 > **`sender_stream`**, and a working **`receiver_stream`** daemon: decoupled receive/decode, checksum
 > gate, file and `--pipe` modes, **parallel multi-transfer** (routed by FILEID, each finalizing
 > independently), and lost-trailer eviction. Sender → receiver reconstructs the stream
-> **byte-for-byte** over UDP. Remaining receiver perf/parity (`recvmmsg` batching, config file,
-> `verify.log`) and Phases 4–5 are in the [Roadmap](#roadmap). Not yet a drop-in C replacement.
+> **byte-for-byte** over UDP, with `recvmmsg` batching on the capture path. Remaining receiver parity
+> (config file, `verify.log`) and Phases 4–5 are in the [Roadmap](#roadmap). Not yet a drop-in C
+> replacement.
 
 ## Why Ada/SPARK, and why a clean-slate rewrite
 
@@ -117,11 +118,16 @@ protected scheduler).
 **3 concurrent parallel transfers**, byte-comparing each (PASS at 3/12/25 MB, 1–3 groups). Sequential
 transfers through one daemon and eviction-then-recovery are exercised too.
 
-**Throughput note.** The receiver decodes off the capture path, but the OS socket buffer is small by
-default (`net.core.rmem_max`) and loopback has no backpressure, so at aggressive send rates a group
-can occasionally drop below the decode margin. Reliable high-rate operation wants **`recvmmsg`
-batching** (not yet ported) and a **raised `rmem_max`**, exactly as the C reference documents; until
-then the sender's `--pace-us` throttle keeps the receiver in step.
+The capture loop drains the socket in batches with **`recvmmsg` (`MSG_WAITFORONE`)** — up to 64
+datagrams per syscall, returning as soon as one is in hand — which is what lets it keep up. The ABI
+`struct msghdr`/`mmsghdr` layout is hand-bound and guarded by a start-up size check.
+
+**Throughput note.** With `recvmmsg` the receiver keeps up an order of magnitude faster than
+one-at-a-time (`--pace-us 5` is reliable here vs. `40` before). The residual limit is the OS socket
+buffer, which is small by default (`net.core.rmem_max`) and can't be raised without privilege on this
+host — under a full no-pacing blast on loopback a group still occasionally drops below the decode
+margin. A real deployment raises `rmem_max` (as the C reference documents) and/or is paced by the
+diode link; the tools pace the sender to stay comfortably inside the margin.
 
 ### Test result
 
@@ -174,8 +180,8 @@ How the harder obligations were closed:
 - **Phase 2 — `sender_stream`** ✅ proven wire format + stdin framing, single-port emit, UDP, pacing,
   CLI; verified byte-exact over loopback
 - **Phase 3 — `receiver_stream`** ✅ *daemon done*: decoupled capture/decode, parallel per-FILEID
-  transfers, `O_EXCL|O_NOFOLLOW` writes, checksum gate, eviction, `--pipe`, byte-exact end-to-end.
-  *Remaining perf/parity:* `recvmmsg` batching (line rate), config file, `verify.log` journal
+  transfers, **`recvmmsg` batching**, `O_EXCL|O_NOFOLLOW` writes, checksum gate, eviction, `--pipe`,
+  byte-exact end-to-end. *Remaining parity:* config file, `verify.log` journal
 - **Phase 4 — integration** — loopback, simulated loss, multi-file, ENOSPC; reuse the systemd/init units
 - **Phase 5 — proof hardening** ✅ codec core fully proved AoRTE (0 unproved, 0 justified); the
   remaining assurance task is documenting the trusted I/O boundary once Phases 2–3 land

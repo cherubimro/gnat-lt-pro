@@ -2,15 +2,14 @@ pragma SPARK_Mode (Off);   --  trusted I/O + concurrency shell over the proven c
 
 with Ada.Command_Line;         use Ada.Command_Line;
 with Ada.Text_IO;              use Ada.Text_IO;
-with Ada.Streams;
 with Ada.Exceptions;           use Ada.Exceptions;
 with Ada.Real_Time;         use Ada.Real_Time;
 with Ada.Strings;              use Ada.Strings;
 with Ada.Strings.Fixed;
 with Ada.Strings.Unbounded;    use Ada.Strings.Unbounded;
-with Ada.Unchecked_Conversion;
 with Interfaces;               use Interfaces;
 with Interfaces.C;
+with System;
 with GNAT.Sockets;             use GNAT.Sockets;
 with GNAT.OS_Lib;
 with Lt_Types;
@@ -41,17 +40,12 @@ procedure Receiver_Stream is
    use type Lt_Types.Symbol;
    use type Interfaces.Unsigned_32;
    use type Interfaces.C.int;
-   use type Ada.Streams.Stream_Element_Offset;
+   use type Interfaces.C.unsigned;
    use type GNAT.OS_Lib.File_Descriptor;
 
    subtype U32 is Interfaces.Unsigned_32;
    subtype U64 is Interfaces.Unsigned_64;
    subtype FD_Type is GNAT.OS_Lib.File_Descriptor;
-
-   subtype Wire_SEA is
-     Ada.Streams.Stream_Element_Array (1 .. Lt_Wire.Max_Buf_Len);
-   function To_Buf is
-     new Ada.Unchecked_Conversion (Wire_SEA, Lt_Wire.Packet_Buffer);
 
    type Group_Ptr is access Lt_Types.Symbol_Array;
    type State_Ptr is access Dec.State;
@@ -69,6 +63,45 @@ procedure Receiver_Stream is
    function C_Open (Path : Interfaces.C.char_array;
                     Flags, Mode : Interfaces.C.int) return Interfaces.C.int
      with Import, Convention => C, External_Name => "open";
+
+   --  recvmmsg batching: drain up to Batch datagrams per syscall (the C
+   --  reference's technique for keeping up with a line-rate blast).  The record
+   --  layouts mirror <sys/socket.h> struct iovec / msghdr / mmsghdr exactly.
+   Batch : constant := 64;
+
+   type Iovec is record
+      Base : System.Address    := System.Null_Address;
+      Len  : Interfaces.C.size_t := 0;
+   end record with Convention => C;
+
+   type Msghdr is record
+      Name       : System.Address       := System.Null_Address;
+      Namelen    : Interfaces.C.unsigned := 0;
+      Iov        : System.Address        := System.Null_Address;
+      Iovlen     : Interfaces.C.size_t   := 0;
+      Control    : System.Address        := System.Null_Address;
+      Controllen : Interfaces.C.size_t   := 0;
+      Flags      : Interfaces.C.int       := 0;
+   end record with Convention => C;
+
+   type Mmsghdr is record
+      Hdr : Msghdr;
+      Len : Interfaces.C.unsigned := 0;
+   end record with Convention => C;
+
+   function C_Recvmmsg (FD : Interfaces.C.int; Msgs : System.Address;
+                        Vlen : Interfaces.C.unsigned; Flags : Interfaces.C.int;
+                        Timeout : System.Address) return Interfaces.C.int
+     with Import, Convention => C, External_Name => "recvmmsg";
+
+   function Errno_Loc return access Interfaces.C.int
+     with Import, Convention => C, External_Name => "__errno_location";
+
+   E_INTR : constant := 4;
+   --  Return as soon as >= 1 datagram is in hand (then grab any others already
+   --  queued, non-blocking).  Without it recvmmsg blocks until all `vlen`
+   --  messages arrive or SO_RCVTIMEO expires -- disastrous latency at low rates.
+   MSG_WAITFORONE : constant := 16#10000#;
 
    Pipe_Mode : Boolean := False;
    Progress  : Boolean := False;
@@ -409,6 +442,15 @@ procedure Receiver_Stream is
    Argi  : Natural := 1;
    A_Spool : Unbounded_String;
 
+   --  recvmmsg receive batch: Batch packet buffers, each wired to a message.
+   FD_C : Interfaces.C.int;
+   type Buf_Pool is array (1 .. Batch) of aliased Lt_Wire.Packet_Buffer;
+   type Iov_Pool is array (1 .. Batch) of aliased Iovec;
+   type Msg_Pool is array (1 .. Batch) of aliased Mmsghdr;
+   Bufs : Buf_Pool;
+   Iovs : Iov_Pool;
+   Msgs : Msg_Pool;
+
    procedure Post_Group (Slot : Natural; Last, Corrupt : Boolean;
                          Total : U64; Cksum : Lt_Types.Symbol) is
       J : Job;
@@ -437,7 +479,106 @@ procedure Receiver_Stream is
       end loop;
    end Sweep_Evictions;
 
+   --  Process one received datagram.  Stop is set when a --pipe transfer's
+   --  trailer arrives (the single-shot pipe mode should then exit).
+   procedure Handle (PB : Lt_Wire.Packet_Buffer; Stop : out Boolean) is
+      Raw       : constant Lt_Wire.Name_String := Lt_Wire.Name_Field (PB);
+      File_Size : U64;
+      Group     : U32;
+      Part      : U32;
+      Payload   : Lt_Types.Symbol;
+      Ok        : Boolean;
+      Ids       : Lt_Types.Id_Array (1 .. K);
+      Deg       : Lt_Types.Degree_Range;
+      Slot      : Natural;
+      Is_New    : Boolean;
+   begin
+      Stop := False;
+      Lt_Wire.Parse (PB, File_Size, Group, Part, Payload);
+
+      if Part = Lt_Wire.Part_Eot then
+         Slot := Slots.Find (Raw);                --  trailer: route to existing
+         if Slot /= 0 and then C_Have (Slot) then
+            Post_Group (Slot, Last => True, Corrupt => False,
+                        Total => File_Size, Cksum => Payload);
+            Slots.Set_Draining (Slot);
+            if Pipe_Mode then Stop := True; end if;
+         end if;
+         return;
+      end if;
+
+      Slots.Route (Raw, Slot, Is_New);
+      if Slot = 0 then
+         return;                                  --  table full: drop
+      end if;
+
+      if Is_New then
+         declare
+            Name : constant String := Sanitize (Raw);
+            FD   : FD_Type;
+            Path : Unbounded_String;
+         begin
+            if Name = "" then
+               Put_Line (Standard_Error, "[rs] rejected unsafe FILEID");
+               Slots.Free_Slot (Slot);
+               return;
+            end if;
+            if Pipe_Mode then
+               FD := GNAT.OS_Lib.Standout;
+               Path := To_Unbounded_String (Name);
+            else
+               Open_Output (To_String (A_Spool), Name, FD, Path);
+               if FD = GNAT.OS_Lib.Invalid_FD then
+                  Put_Line (Standard_Error,
+                    "[rs] cannot create output for " & Name);
+                  Slots.Free_Slot (Slot);
+                  return;
+               end if;
+               Put_Line (Standard_Error,
+                 "[rs] new transfer -> " & To_String (Path));
+            end if;
+            C_FD (Slot) := FD;
+            C_Path (Slot) := Path;
+            C_Have (Slot) := False;
+            C_First (Slot) := True;
+         end;
+      end if;
+
+      if C_Have (Slot) and then Group /= C_Group (Slot) then
+         Post_Group (Slot, Last => False, Corrupt => False,
+                     Total => 0, Cksum => Lt_Types.Zero_Symbol);
+      end if;
+
+      if not C_Have (Slot) then
+         Sched.Acquire (C_Idx (Slot));
+         Dec.Reset (Pool_State (C_Idx (Slot)).all);
+         C_Group (Slot) := Group;
+         C_Have (Slot) := True;
+      end if;
+
+      if Part < U32 (K) then
+         Ids (1) := Natural (Part);
+         Dec.Add_Packet (Pool_State (C_Idx (Slot)).all, 1, Ids, Payload, Ok);
+      else
+         declare
+            Idx   : constant Natural := Natural (Part) - K;
+            CSeed : constant U64 :=
+              Lt_Rng.Coding_Seed (Seed, U64 (Group), U64 (Idx));
+         begin
+            Lt_Sample.Sample_Indices (CSeed, Deg, Ids);
+            Dec.Add_Packet (Pool_State (C_Idx (Slot)).all, Deg, Ids, Payload, Ok);
+         end;
+      end if;
+      C_Last_Ms (Slot) := Now_Ms;
+   end Handle;
+
 begin
+   --  Guard the hand-written recvmmsg ABI layout (Linux x86-64: 56 / 64 bytes).
+   if Msghdr'Object_Size /= 448 or else Mmsghdr'Object_Size /= 512 then
+      Put_Line (Standard_Error, "[rs] FATAL: mmsghdr ABI layout mismatch");
+      GNAT.OS_Lib.OS_Exit (3);
+   end if;
+
    for I in Pool_State'Range loop
       Pool_State (I) := new Dec.State;
       Sched.Release (I);
@@ -475,118 +616,45 @@ begin
    Put_Line (Standard_Error,
      "[rs] listening on port " & Argument (Argi)
      & (if Pipe_Mode then "  (pipe mode)" else "  spool " & To_String (A_Spool))
-     & "  max_inflight=" & Max_Inflight'Image);
+     & "  max_inflight=" & Max_Inflight'Image & "  batch=" & Batch'Image);
+
+   --  Wire each message in the batch to its own packet buffer (once).
+   for I in 1 .. Batch loop
+      Iovs (I) := (Base => Bufs (I)'Address, Len => Lt_Wire.Max_Buf_Len);
+      Msgs (I) := (Hdr => (Name       => System.Null_Address,
+                           Namelen    => 0,
+                           Iov        => Iovs (I)'Address,
+                           Iovlen     => 1,
+                           Control    => System.Null_Address,
+                           Controllen => 0,
+                           Flags      => 0),
+                   Len => 0);
+   end loop;
+   FD_C := Interfaces.C.int (GNAT.Sockets.To_C (Sock));
 
    Capture :
    loop
       declare
-         Buf  : Wire_SEA;
-         Last : Ada.Streams.Stream_Element_Offset;
-         From : Sock_Addr_Type;
+         --  Drain up to Batch datagrams in one syscall.  SO_RCVTIMEO bounds the
+         --  idle wait so eviction still ticks; NULL timeout avoids recvmmsg's
+         --  partial-batch timeout quirk.
+         R    : constant Interfaces.C.int :=
+           C_Recvmmsg (FD_C, Msgs'Address, Interfaces.C.unsigned (Batch),
+                       MSG_WAITFORONE, System.Null_Address);
+         Stop : Boolean;
       begin
-         Receive_Socket (Sock, Buf, Last, From);
-         if Last /= Buf'Last then
-            goto Continue;                        --  short datagram: ignore
-         end if;
-
-         declare
-            PB        : constant Lt_Wire.Packet_Buffer := To_Buf (Buf);
-            Raw       : constant Lt_Wire.Name_String := Lt_Wire.Name_Field (PB);
-            File_Size : U64;
-            Group     : U32;
-            Part      : U32;
-            Payload   : Lt_Types.Symbol;
-            Ok        : Boolean;
-            Ids       : Lt_Types.Id_Array (1 .. K);
-            Deg       : Lt_Types.Degree_Range;
-            Slot      : Natural;
-            Is_New    : Boolean;
-         begin
-            Lt_Wire.Parse (PB, File_Size, Group, Part, Payload);
-
-            if Part = Lt_Wire.Part_Eot then
-               Slot := Slots.Find (Raw);          --  trailer: route to existing
-               if Slot /= 0 and then C_Have (Slot) then
-                  Post_Group (Slot, Last => True, Corrupt => False,
-                              Total => File_Size, Cksum => Payload);
-                  Slots.Set_Draining (Slot);
-                  exit Capture when Pipe_Mode;     --  --pipe is single-shot
+         if R <= 0 then
+            if not (R < 0 and then Errno_Loc.all = E_INTR) then
+               Sweep_Evictions;                   --  timeout / no data: reap
+            end if;
+         else
+            for I in 1 .. Natural (R) loop
+               if Msgs (I).Len = Lt_Wire.Max_Buf_Len then
+                  Handle (Bufs (I), Stop);
+                  exit Capture when Stop;
                end if;
-               goto Continue;
-            end if;
-
-            Slots.Route (Raw, Slot, Is_New);
-            if Slot = 0 then
-               goto Continue;                     --  table full: drop
-            end if;
-
-            if Is_New then
-               declare
-                  Name : constant String := Sanitize (Raw);
-                  FD   : FD_Type;
-                  Path : Unbounded_String;
-               begin
-                  if Name = "" then
-                     Put_Line (Standard_Error, "[rs] rejected unsafe FILEID");
-                     Slots.Free_Slot (Slot);
-                     goto Continue;
-                  end if;
-                  if Pipe_Mode then
-                     FD := GNAT.OS_Lib.Standout;
-                     Path := To_Unbounded_String (Name);
-                  else
-                     Open_Output (To_String (A_Spool), Name, FD, Path);
-                     if FD = GNAT.OS_Lib.Invalid_FD then
-                        Put_Line (Standard_Error,
-                          "[rs] cannot create output for " & Name);
-                        Slots.Free_Slot (Slot);
-                        goto Continue;
-                     end if;
-                     Put_Line (Standard_Error,
-                       "[rs] new transfer -> " & To_String (Path));
-                  end if;
-                  C_FD (Slot) := FD;
-                  C_Path (Slot) := Path;
-                  C_Have (Slot) := False;
-                  C_First (Slot) := True;
-               end;
-            end if;
-
-            --  New group of this transfer => post the completed current one.
-            if C_Have (Slot) and then Group /= C_Group (Slot) then
-               Post_Group (Slot, Last => False, Corrupt => False,
-                           Total => 0, Cksum => Lt_Types.Zero_Symbol);
-            end if;
-
-            if not C_Have (Slot) then
-               Sched.Acquire (C_Idx (Slot));
-               Dec.Reset (Pool_State (C_Idx (Slot)).all);
-               C_Group (Slot) := Group;
-               C_Have (Slot) := True;
-            end if;
-
-            if Part < U32 (K) then
-               Ids (1) := Natural (Part);
-               Dec.Add_Packet (Pool_State (C_Idx (Slot)).all, 1, Ids, Payload, Ok);
-            else
-               declare
-                  Idx   : constant Natural := Natural (Part) - K;
-                  CSeed : constant U64 :=
-                    Lt_Rng.Coding_Seed (Seed, U64 (Group), U64 (Idx));
-               begin
-                  Lt_Sample.Sample_Indices (CSeed, Deg, Ids);
-                  Dec.Add_Packet (Pool_State (C_Idx (Slot)).all, Deg, Ids,
-                                  Payload, Ok);
-               end;
-            end if;
-            C_Last_Ms (Slot) := Now_Ms;
-         end;
-
-         <<Continue>>
-         null;
-      exception
-         when Socket_Error =>                     --  receive timeout tick
-            Sweep_Evictions;
+            end loop;
+         end if;
       end;
    end loop Capture;
 
