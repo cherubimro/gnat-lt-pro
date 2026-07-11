@@ -9,11 +9,12 @@ the **Robust Soliton Distribution**; the receiver reconstructs the file from *an
 subset that arrives. This repository is a clean-slate rewrite of both ends in Ada, with the codec
 core written in the **SPARK** subset and proved free of run-time errors by `gnatprove`.
 
-> Status: **Phases 0–3 (core) complete** — the proven codec core, the proven wire format, a working
-> **`sender_stream`**, and a working **`receiver_stream`** (decoupled receive/decode, checksum gate,
-> file and `--pipe` modes). Sender → receiver reconstructs the stream **byte-for-byte** over UDP.
-> Remaining receiver polish (persistent daemon loop, parallel multi-transfer, `recvmmsg`, config file)
-> and Phases 4–5 are in the [Roadmap](#roadmap). A work in progress, not yet a drop-in C replacement.
+> Status: **Phases 0–3 complete** — the proven codec core, the proven wire format, a working
+> **`sender_stream`**, and a working **`receiver_stream`** daemon: decoupled receive/decode, checksum
+> gate, file and `--pipe` modes, **parallel multi-transfer** (routed by FILEID, each finalizing
+> independently), and lost-trailer eviction. Sender → receiver reconstructs the stream
+> **byte-for-byte** over UDP. Remaining receiver perf/parity (`recvmmsg` batching, config file,
+> `verify.log`) and Phases 4–5 are in the [Roadmap](#roadmap). Not yet a drop-in C replacement.
 
 ## Why Ada/SPARK, and why a clean-slate rewrite
 
@@ -97,23 +98,30 @@ index — both ends derive the packet seed from `(SEED, group, index)` with `Lt_
 receiver_stream [--pipe] [--progress] <port> <spool> <SEED> <loss%>
 ```
 
-A tight **capture loop** parses each datagram and accumulates it into a pre-allocated group decoder
-state — never decoding inline, so the socket buffer does not overflow. A separate **decode task**
-reconstructs each completed group, writes it out, and on the trailer applies the whole-stream
-**checksum gate**. Bounded RAM: at most `Pool_N` group states are live.
+A tight **capture loop** parses each datagram, **routes it to its transfer by FILEID**, and
+accumulates it into a pre-allocated group decoder state — never decoding inline. A separate
+**decode task** reconstructs each completed group, writes it to that transfer's output, and on the
+trailer applies the whole-stream **checksum gate**. Up to `Max_Inflight` transfers are in flight at
+once, each finalizing independently; bounded RAM (a shared pool of group states handed off through a
+protected scheduler).
 
-- **file mode** creates `<spool>/<name>` with `open(O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW)` (never
-  overwrites, never follows a planted symlink; numbered `.1`, `.2`, … on collision) after sanitizing
-  the FILEID to a safe basename, then writes a `.finished` (or `.corrupt`) marker per the gate.
-- **`--pipe`** streams the decoded bytes straight to stdout; the exit code is the verdict.
-- A stalled stream (lost trailer) is evicted after a 10 s receive timeout → `.corrupt`.
+- **file mode** is a daemon (loops indefinitely) creating `<spool>/<name>` with
+  `open(O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW)` (never overwrites, never follows a planted symlink;
+  numbered `.1`, `.2`, … on collision) after sanitizing the FILEID to a safe basename, then writes a
+  `.finished` (or `.corrupt`) marker per the gate.
+- **`--pipe`** streams the decoded bytes straight to stdout, single-shot; the exit code is the verdict.
+- A stalled transfer (lost trailer) is evicted after a 10 s idle timeout → `.corrupt`, **without
+  disturbing the other in-flight transfers**.
 
-*Verification:* `tools/receiver-test.sh` runs sender → `receiver_stream` in both modes and byte-compares
-the output (PASS at 3/12/25 MB, 1–3 groups). `tools/loopback-test.sh` + `udp_decode_sink` do the same
-against a lightweight decode stand-in.
+*Verification:* `tools/receiver-test.sh` runs sender → `receiver_stream` in file mode, `--pipe`, and
+**3 concurrent parallel transfers**, byte-comparing each (PASS at 3/12/25 MB, 1–3 groups). Sequential
+transfers through one daemon and eviction-then-recovery are exercised too.
 
-Not yet ported from the C daemon: a persistent multi-transfer loop, parallel per-FILEID decode,
-`recvmmsg` batching, the config file, and the `verify.log` journal (see Roadmap).
+**Throughput note.** The receiver decodes off the capture path, but the OS socket buffer is small by
+default (`net.core.rmem_max`) and loopback has no backpressure, so at aggressive send rates a group
+can occasionally drop below the decode margin. Reliable high-rate operation wants **`recvmmsg`
+batching** (not yet ported) and a **raised `rmem_max`**, exactly as the C reference documents; until
+then the sender's `--pace-us` throttle keeps the receiver in step.
 
 ### Test result
 
@@ -165,9 +173,9 @@ How the harder obligations were closed:
 - **Phase 1 — proven codec core** ✅ AoRTE-clean incl. the peeling decoder
 - **Phase 2 — `sender_stream`** ✅ proven wire format + stdin framing, single-port emit, UDP, pacing,
   CLI; verified byte-exact over loopback
-- **Phase 3 — `receiver_stream`** 🔨 *core done*: decoupled capture/decode, `O_EXCL|O_NOFOLLOW`
-  writes, checksum gate, eviction, `--pipe`, byte-exact end-to-end. *Remaining:* persistent
-  multi-transfer daemon loop, parallel per-FILEID decode, `recvmmsg` batching, config file, `verify.log`
+- **Phase 3 — `receiver_stream`** ✅ *daemon done*: decoupled capture/decode, parallel per-FILEID
+  transfers, `O_EXCL|O_NOFOLLOW` writes, checksum gate, eviction, `--pipe`, byte-exact end-to-end.
+  *Remaining perf/parity:* `recvmmsg` batching (line rate), config file, `verify.log` journal
 - **Phase 4 — integration** — loopback, simulated loss, multi-file, ENOSPC; reuse the systemd/init units
 - **Phase 5 — proof hardening** ✅ codec core fully proved AoRTE (0 unproved, 0 justified); the
   remaining assurance task is documenting the trusted I/O boundary once Phases 2–3 land
