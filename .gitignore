@@ -1,0 +1,17 @@
+# Build artifacts
+/obj/
+/bin/
+
+# GNAT / gprbuild
+*.o
+*.ali
+*.adt
+b__*.ad[bs]
+
+# SPARK / gnatprove
+/obj/gnatprove/
+gnatprove/
+
+# Editor/OS
+*~
+.DS_Store
