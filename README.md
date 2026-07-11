@@ -9,10 +9,11 @@ the **Robust Soliton Distribution**; the receiver reconstructs the file from *an
 subset that arrives. This repository is a clean-slate rewrite of both ends in Ada, with the codec
 core written in the **SPARK** subset and proved free of run-time errors by `gnatprove`.
 
-> Status: **Phases 0–2 complete** — the proven, allocation-free codec core, the proven wire format,
-> and a working **`sender_stream`** binary, verified end-to-end over UDP (a decode sink reconstructs
-> the stream byte-for-byte). The receiver daemon is Phases 3–5 (see [Roadmap](#roadmap)). This is a
-> work in progress, not yet a drop-in replacement for the C tools.
+> Status: **Phases 0–3 (core) complete** — the proven codec core, the proven wire format, a working
+> **`sender_stream`**, and a working **`receiver_stream`** (decoupled receive/decode, checksum gate,
+> file and `--pipe` modes). Sender → receiver reconstructs the stream **byte-for-byte** over UDP.
+> Remaining receiver polish (persistent daemon loop, parallel multi-transfer, `recvmmsg`, config file)
+> and Phases 4–5 are in the [Roadmap](#roadmap). A work in progress, not yet a drop-in C replacement.
 
 ## Why Ada/SPARK, and why a clean-slate rewrite
 
@@ -44,7 +45,7 @@ enumerable **trusted** column.
 | Layer | Mode | Contents |
 |---|---|---|
 | **`src/codec` — the codec core** | `SPARK_Mode => On` | RNG + coding-seed mix, robust-soliton PMF/CDF + sampler, index sampling, LT encoder, peeling decoder, XOR checksum, **wire (de)serialization** |
-| **`src` — the I/O shell** | `SPARK_Mode => Off` (trusted Ada) | `sender_stream` (UDP send, stdin framing, CLI, pacing); *(Phase 3)* the receiver daemon: `recvmmsg`, worker tasks, file writes, per-FILEID table, config, logging |
+| **`src` — the I/O shell** | `SPARK_Mode => Off` (trusted Ada) | `sender_stream` (UDP send, stdin framing, pacing); `receiver_stream` (UDP capture, decoupled decode task, hardened file output, checksum gate, `--pipe`) |
 
 The core is **allocation-free**: it operates on caller-supplied buffers with fixed-capacity working
 storage, so any heap lives only in the trusted shell and the bounds stay provable. It is also
@@ -70,10 +71,11 @@ Toolchain: **GNAT 14.2.0 + gprbuild 24 + gnatprove** (SPARK). `tools/env.sh` put
 (adjust the paths there if the toolchain moves).
 
 ```sh
-./tools/build.sh          # gprbuild -> bin/{test_codec,sender_stream,udp_decode_sink}
-./bin/test_codec          # in-memory round-trip test matrix
-./tools/prove.sh          # gnatprove over the whole SPARK core (incl. lt_wire)
-./tools/loopback-test.sh  # end-to-end: sender_stream -> decode sink, byte-compared
+./tools/build.sh           # gprbuild -> bin/{test_codec,sender_stream,receiver_stream,udp_decode_sink}
+./bin/test_codec           # in-memory round-trip test matrix
+./tools/prove.sh           # gnatprove over the whole SPARK core (incl. lt_wire)
+./tools/receiver-test.sh   # end-to-end: sender_stream -> receiver_stream (file + pipe)
+./tools/loopback-test.sh   # end-to-end: sender_stream -> decode sink, byte-compared
 ```
 
 ### Sender
@@ -89,9 +91,29 @@ whole-stream checksum. `SEED` and `loss%` must match the receiver. `--pace-us` t
 (a real diode is paced by network backpressure; loopback is not). Coding packets carry only their
 index — both ends derive the packet seed from `(SEED, group, index)` with `Lt_Rng.Coding_Seed`.
 
-*Verification:* `udp_decode_sink` (a stand-in, not the Phase-3 daemon) accumulates the stream and
-reconstructs it with the proven decoder; `tools/loopback-test.sh` runs sender → sink and confirms
-the output is **byte-identical** to the input (validated at 3 MB / 12 MB / 25 MB, 1–3 groups).
+### Receiver
+
+```sh
+receiver_stream [--pipe] [--progress] <port> <spool> <SEED> <loss%>
+```
+
+A tight **capture loop** parses each datagram and accumulates it into a pre-allocated group decoder
+state — never decoding inline, so the socket buffer does not overflow. A separate **decode task**
+reconstructs each completed group, writes it out, and on the trailer applies the whole-stream
+**checksum gate**. Bounded RAM: at most `Pool_N` group states are live.
+
+- **file mode** creates `<spool>/<name>` with `open(O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW)` (never
+  overwrites, never follows a planted symlink; numbered `.1`, `.2`, … on collision) after sanitizing
+  the FILEID to a safe basename, then writes a `.finished` (or `.corrupt`) marker per the gate.
+- **`--pipe`** streams the decoded bytes straight to stdout; the exit code is the verdict.
+- A stalled stream (lost trailer) is evicted after a 10 s receive timeout → `.corrupt`.
+
+*Verification:* `tools/receiver-test.sh` runs sender → `receiver_stream` in both modes and byte-compares
+the output (PASS at 3/12/25 MB, 1–3 groups). `tools/loopback-test.sh` + `udp_decode_sink` do the same
+against a lightweight decode stand-in.
+
+Not yet ported from the C daemon: a persistent multi-transfer loop, parallel per-FILEID decode,
+`recvmmsg` batching, the config file, and the `verify.log` journal (see Roadmap).
 
 ### Test result
 
@@ -143,8 +165,9 @@ How the harder obligations were closed:
 - **Phase 1 — proven codec core** ✅ AoRTE-clean incl. the peeling decoder
 - **Phase 2 — `sender_stream`** ✅ proven wire format + stdin framing, single-port emit, UDP, pacing,
   CLI; verified byte-exact over loopback
-- **Phase 3 — `receiver_stream`** — `recvmmsg`, per-FILEID parallel decode, `O_EXCL|O_NOFOLLOW`
-  writes, checksum gate, eviction, `--pipe`, config file
+- **Phase 3 — `receiver_stream`** 🔨 *core done*: decoupled capture/decode, `O_EXCL|O_NOFOLLOW`
+  writes, checksum gate, eviction, `--pipe`, byte-exact end-to-end. *Remaining:* persistent
+  multi-transfer daemon loop, parallel per-FILEID decode, `recvmmsg` batching, config file, `verify.log`
 - **Phase 4 — integration** — loopback, simulated loss, multi-file, ENOSPC; reuse the systemd/init units
 - **Phase 5 — proof hardening** ✅ codec core fully proved AoRTE (0 unproved, 0 justified); the
   remaining assurance task is documenting the trusted I/O boundary once Phases 2–3 land
