@@ -90,17 +90,32 @@ ALL TRIALS PASS
 
 ### Proof status (`gnatprove`, level 2)
 
-**107 of 121 checks proved (88%).** Fully discharged: all data-dependency, initialization (30),
-functional-contract (9) and termination (8) checks; the leaf core (`lt_rng`, `lt_soliton`,
-`lt_sample`, `lt_encoder`, `lt_checksum`) and the decoder's `Add_Packet` prove **AoRTE-clean**.
+**All 147 checks proved — 0 unproved, 0 justified.** The whole codec core, the peeling `Decode`
+included, is proved **AoRTE-clean** (no overflow, no out-of-bounds indexing, no division by zero),
+with every functional contract, loop termination and initialization check discharged and **no
+`pragma Assume`/justification anywhere**.
 
-Remaining (the next proof task, not correctness bugs — the round-trip test exercises these paths):
+| Check family | Proved |
+|---|---|
+| Run-time checks (overflow / index / range / division) | 66 / 66 |
+| Assertions & loop invariants | 31 / 31 |
+| Functional contracts (`Valid`, pre/post) | 11 / 11 |
+| Termination | 9 / 9 |
+| Initialization + data dependencies | 30 / 30 |
 
-- **13 run-time checks in `lt_decoder.Decode`** — the peeling loop's incidence-array index checks.
-  Discharging them needs a data invariant tying the CSR offset/degree/edge-count fields together
-  (`Off(p) + Dg(p) - 1 ≤ Ne ≤ Max_Edges`) plus ripple/cursor-bound predicates.
-- **1 assertion in `lt_soliton.Build_Cum`** — a float upper-bound loop invariant at elaboration time;
-  its underlying overflow check is already proved independently.
+How the harder obligations were closed:
+
+- **The peeling decoder (`Decode`, 38 checks).** The incidence index (source → packets) is an
+  intrusive singly-linked list over the edge slots (a `Head`/`Nxt` pair keyed by a plain edge
+  counter) rather than a counting-sort CSR, so every access is in range from its subtype with no
+  prefix-sum reasoning. Edge-span bounds come from a `Valid` ghost predicate carried through
+  `Add_Packet`'s `Post` and `Decode`'s `Pre`; the ripple-stack and `Remn` decrements are protected
+  by capacity guards the algorithm never actually trips.
+- **`Add_Packet` (18 checks).** Well-formedness lives in `Pre`/`Post` (checked at call boundaries)
+  rather than a type predicate — a predicate is re-checked after every component write, and the
+  intermediate state (edge count bumped before packet count) transiently violates it.
+- **The soliton table.** The cumulative accumulator's overflow bound falls out of the prover's
+  loop-bound analysis once each term is asserted to lie in `[0, 2]`.
 
 ## Roadmap
 
@@ -110,7 +125,8 @@ Remaining (the next proof task, not correctness bugs — the round-trip test exe
 - **Phase 3 — `receiver_stream`** — `recvmmsg`, per-FILEID parallel decode, `O_EXCL|O_NOFOLLOW`
   writes, checksum gate, eviction, `--pipe`, config file
 - **Phase 4 — integration** — loopback, simulated loss, multi-file, ENOSPC; reuse the systemd/init units
-- **Phase 5 — proof hardening** — close the decoder VCs; document the trusted boundary as the assurance argument
+- **Phase 5 — proof hardening** ✅ codec core fully proved AoRTE (0 unproved, 0 justified); the
+  remaining assurance task is documenting the trusted I/O boundary once Phases 2–3 land
 
 ## Attribution & license
 

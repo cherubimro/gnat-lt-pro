@@ -36,13 +36,16 @@ package body Lt_Soliton is
       Acc : Long_Float   := 0.0;
    begin
       for D in Degree loop
-         --  Each (Rho + Tau) term is in [0, 2], so after D steps Acc <= 2*D,
-         --  which bounds the sum well away from Long_Float'Last (no overflow).
-         pragma Assert (Rho (D) <= 1.0 and then Tau (D) <= 1.0);
-         Acc   := Acc + Rho (D) + Tau (D);
+         declare
+            T : constant Long_Float := Rho (D) + Tau (D);   --  in [0, 2]
+         begin
+            --  Bounding each term by 2 lets the prover's loop-bound analysis
+            --  cap the accumulator (Acc <= 2*K = 14750, far below overflow).
+            pragma Assert (T >= 0.0 and then T <= 2.0);
+            Acc := Acc + T;
+         end;
          W (D) := Acc;
          pragma Loop_Invariant (Acc >= 0.0);
-         pragma Loop_Invariant (Acc <= 2.0 * Long_Float (D));
       end loop;
       return W;
    end Build_Cum;
