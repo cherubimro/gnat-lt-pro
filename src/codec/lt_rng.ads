@@ -41,4 +41,10 @@ package Lt_Rng is
    with
      Post => R < Bound;
 
+   --  Per-coding-packet seed: a deterministic O(1) function of the transfer
+   --  seed, group index and coding index, agreed by both ends.  It carries only
+   --  (part_no - K) on the wire; each side recomputes the full seed with this
+   --  and replays Lt_Sample to learn the packet's source-symbol set.
+   function Coding_Seed (Seed, Group, Idx : U64) return U64;
+
 end Lt_Rng;

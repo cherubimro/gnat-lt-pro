@@ -44,4 +44,13 @@ package body Lt_Rng is
       R := Natural (V mod U64 (Bound));
    end Next_Below;
 
+   --  SplitMix64 finalizer applied to a linear combination of the inputs.
+   function Coding_Seed (Seed, Group, Idx : U64) return U64 is
+      Z : U64 := Seed + Group * Gamma + Idx * Mix_1;
+   begin
+      Z := (Z xor Interfaces.Shift_Right (Z, 30)) * Mix_1;
+      Z := (Z xor Interfaces.Shift_Right (Z, 27)) * Mix_2;
+      return Z xor Interfaces.Shift_Right (Z, 31);
+   end Coding_Seed;
+
 end Lt_Rng;

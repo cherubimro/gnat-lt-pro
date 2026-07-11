@@ -6,10 +6,10 @@
 --  (added in later phases) is trusted Ada.  See README.md for the layering.
 project Lt_Diode is
 
-   for Source_Dirs use ("src/codec", "tests");
+   for Source_Dirs use ("src/codec", "src", "tests");
    for Object_Dir  use "obj";
    for Exec_Dir    use "bin";
-   for Main        use ("test_codec.adb");
+   for Main        use ("test_codec.adb", "sender_stream.adb", "udp_decode_sink.adb");
 
    package Compiler is
       --  -gnat2022 : Ada 2022 (for the newer contract/quantifier syntax).
