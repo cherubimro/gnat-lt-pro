@@ -2,6 +2,8 @@ pragma SPARK_Mode (Off);   --  trusted I/O + concurrency shell over the proven c
 
 with Ada.Command_Line;         use Ada.Command_Line;
 with Ada.Text_IO;              use Ada.Text_IO;
+with Ada.Calendar;
+with Ada.Calendar.Formatting;
 with Ada.Exceptions;           use Ada.Exceptions;
 with Ada.Real_Time;         use Ada.Real_Time;
 with Ada.Strings;              use Ada.Strings;
@@ -18,6 +20,7 @@ with Lt_Sample;
 with Lt_Checksum;
 with Lt_Wire;
 with Lt_Decoder_Std;
+with Lt_Conf;
 
 --  Streaming LT receiver daemon.  A tight capture loop routes each datagram to
 --  its transfer by FILEID and accumulates it into a pre-allocated group decoder
@@ -59,7 +62,12 @@ procedure Receiver_Stream is
    O_WRONLY   : constant := 1;
    O_CREAT    : constant := 8#100#;
    O_EXCL     : constant := 8#200#;
+   O_APPEND   : constant := 8#2000#;
    O_NOFOLLOW : constant := 8#400000#;
+
+   --  The per-transfer verdict journal (verify.log); opened once, appended by
+   --  the decode task as each transfer finalizes.
+   Verify_FD : GNAT.OS_Lib.File_Descriptor := GNAT.OS_Lib.Invalid_FD;
    function C_Open (Path : Interfaces.C.char_array;
                     Flags, Mode : Interfaces.C.int) return Interfaces.C.int
      with Import, Convention => C, External_Name => "open";
@@ -266,6 +274,22 @@ procedure Receiver_Stream is
    --  blocks on the job queue until the first group is posted, long after).
    Pool_State : array (1 .. Pool_N) of State_Ptr;
 
+   --  Append one structured verdict line to verify.log (called only from the
+   --  single decode task, so no locking).
+   procedure Write_Verify (Name : String; Bytes : U64; Verdict, Reason : String)
+   is
+      Line : constant String :=
+        Ada.Calendar.Formatting.Image (Ada.Calendar.Clock) & " " & Name
+        & " bytes=" & Bytes'Image & " verdict=" & Verdict
+        & " reason=" & Reason & ASCII.LF;
+      N : Integer;
+      pragma Unreferenced (N);
+   begin
+      if Verify_FD /= GNAT.OS_Lib.Invalid_FD then
+         N := GNAT.OS_Lib.Write (Verify_FD, Line'Address, Line'Length);
+      end if;
+   end Write_Verify;
+
    task Decode_Task with Storage_Size => 16 * 1024 * 1024;
 
    task body Decode_Task is
@@ -341,10 +365,22 @@ procedure Receiver_Stream is
                         end if;
                      end;
                   end if;
-                  Put_Line (Standard_Error,
-                    "[rs] transfer done (" & To_String (J.Path)
-                    & "): bytes=" & J.Total_Bytes'Image
-                    & (if Ok then "  VERIFIED" else "  CORRUPT"));
+                  declare
+                     Reason : constant String :=
+                       (if J.Corrupt then "eviction"
+                        elsif D_Fail (S) then "decode"
+                        elsif D_Wrote (S) /= J.Total_Bytes then "size"
+                        elsif not Ok then "checksum"
+                        else "ok");
+                  begin
+                     Put_Line (Standard_Error,
+                       "[rs] transfer done (" & To_String (J.Path)
+                       & "): bytes=" & J.Total_Bytes'Image
+                       & (if Ok then "  VERIFIED" else "  CORRUPT reason="
+                                                       & Reason));
+                     Write_Verify (To_String (J.Path), J.Total_Bytes,
+                                   (if Ok then "ok" else "corrupt"), Reason);
+                  end;
                   Slots.Free_Slot (S);
                   if J.Pipe then
                      Sched.Finish_Pipe (if Ok then 0 else 1);
@@ -581,39 +617,92 @@ begin
       Sched.Release (I);
    end loop;
 
-   --  CLI: [--pipe] [--progress] <port> <spool> <SEED> <loss%>
-   while Argi <= Argument_Count
-     and then Argument (Argi)'Length >= 2
-     and then Argument (Argi) (Argument (Argi)'First .. Argument (Argi)'First + 1) = "--"
-   loop
-      if Argument (Argi) = "--pipe" then
-         Pipe_Mode := True;
-      elsif Argument (Argi) = "--progress" then
-         Progress := True;
-      end if;
-      Argi := Argi + 1;
-   end loop;
+   --  CLI: [--pipe] [--progress] [--config <file>] [<port> <spool> <SEED> <loss%>]
+   --  Precedence: built-in defaults < config file < the four positional args.
+   declare
+      Config_Path : Unbounded_String := Null_Unbounded_String;
+   begin
+      while Argi <= Argument_Count
+        and then Argument (Argi)'Length >= 2
+        and then Argument (Argi) (Argument (Argi)'First .. Argument (Argi)'First + 1) = "--"
+      loop
+         if Argument (Argi) = "--pipe" then
+            Pipe_Mode := True;
+         elsif Argument (Argi) = "--progress" then
+            Progress := True;
+         elsif Argument (Argi) = "--config" then
+            Argi := Argi + 1;
+            if Argi <= Argument_Count then
+               Config_Path := To_Unbounded_String (Argument (Argi));
+            end if;
+         end if;
+         Argi := Argi + 1;
+      end loop;
 
-   if Argument_Count - Argi + 1 /= 4 then
-      Put_Line (Standard_Error,
-        "[usage] receiver_stream [--pipe] [--progress] <port> <spool> <SEED> <loss%>");
-      GNAT.OS_Lib.OS_Exit (2);
-   end if;
+      declare
+         Conf   : Lt_Conf.Config;
+         Loaded : Boolean;
+         Nargs  : constant Natural := Argument_Count - Argi + 1;
+         function Val (Idx : Natural; Key, Def : String) return String is
+           (if Nargs = 4 then Argument (Argi + Idx)
+            else Lt_Conf.Get (Conf, Key, Def));
+      begin
+         Lt_Conf.Load
+           (Conf,
+            (if Config_Path /= Null_Unbounded_String then To_String (Config_Path)
+             else "/etc/lt-diode/receiver.conf"),
+            Loaded);
 
-   A_Spool := To_Unbounded_String (Argument (Argi + 1));
-   Seed := U64'Value (Argument (Argi + 2));
+         if Nargs /= 0 and then Nargs /= 4 then
+            Put_Line (Standard_Error,
+              "[usage] receiver_stream [--pipe] [--progress] [--config <file>]"
+              & " [<port> <spool> <SEED> <loss%>]");
+            GNAT.OS_Lib.OS_Exit (2);
+         end if;
 
-   Create_Socket (Sock, Family_Inet, Socket_Datagram);
-   Set_Socket_Option (Sock, Socket_Level, (Reuse_Address, True));
-   Set_Socket_Option (Sock, Socket_Level, (Receive_Buffer, 67_108_864));
-   Bind_Socket (Sock, (Family => Family_Inet, Addr => Any_Inet_Addr,
-                       Port => Port_Type (Natural'Value (Argument (Argi)))));
-   Set_Socket_Option (Sock, Socket_Level, (Receive_Timeout, Timeout => 2.0));
+         declare
+            Port_S  : constant String := Val (0, "port", "");
+            Spool_S : constant String := Val (1, "spool", ".");
+            Seed_S  : constant String := Val (2, "seed", "0");
+         begin
+            if Port_S = "" then
+               Put_Line (Standard_Error,
+                 "[rs] no port given (CLI arg or config 'port' required)");
+               GNAT.OS_Lib.OS_Exit (2);
+            end if;
+            A_Spool := To_Unbounded_String (Spool_S);
+            Seed := U64'Value (Seed_S);
 
-   Put_Line (Standard_Error,
-     "[rs] listening on port " & Argument (Argi)
-     & (if Pipe_Mode then "  (pipe mode)" else "  spool " & To_String (A_Spool))
-     & "  max_inflight=" & Max_Inflight'Image & "  batch=" & Batch'Image);
+            Create_Socket (Sock, Family_Inet, Socket_Datagram);
+            Set_Socket_Option (Sock, Socket_Level, (Reuse_Address, True));
+            Set_Socket_Option (Sock, Socket_Level, (Receive_Buffer, 67_108_864));
+            Bind_Socket (Sock, (Family => Family_Inet, Addr => Any_Inet_Addr,
+                                Port => Port_Type (Natural'Value (Port_S))));
+            Set_Socket_Option
+              (Sock, Socket_Level, (Receive_Timeout, Timeout => 2.0));
+
+            if not Pipe_Mode then                --  open verify.log (append)
+               declare
+                  VLog  : constant String :=
+                    Lt_Conf.Get (Conf, "verify_log", Spool_S & "/verify.log");
+                  Flags : constant Interfaces.C.int :=
+                    O_WRONLY + O_CREAT + O_APPEND;
+                  R : constant Interfaces.C.int :=
+                    C_Open (Interfaces.C.To_C (VLog), Flags, 8#644#);
+               begin
+                  if R >= 0 then Verify_FD := FD_Type (R); end if;
+               end;
+            end if;
+
+            Put_Line (Standard_Error,
+              "[rs] listening on port " & Port_S
+              & (if Pipe_Mode then "  (pipe mode)" else "  spool " & Spool_S)
+              & "  max_inflight=" & Max_Inflight'Image
+              & "  batch=" & Batch'Image
+              & (if Loaded then "  (config loaded)" else ""));
+         end;
+      end;
+   end;
 
    --  Wire each message in the batch to its own packet buffer (once).
    for I in 1 .. Batch loop

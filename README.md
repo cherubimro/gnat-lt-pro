@@ -102,8 +102,14 @@ was dropped, cutting sender traffic ~17% versus the earlier 1.5× target and sim
 ### Receiver
 
 ```sh
-receiver_stream [--pipe] [--progress] <port> <spool> <SEED> <loss%>
+receiver_stream [--pipe] [--progress] [--config <file>] [<port> <spool> <SEED> <loss%>]
 ```
+
+Reads a `key = value` **config file** (`--config <file>`, else `/etc/lt-diode/receiver.conf` if
+present) for `port`, `spool`, `seed`, `loss`, `verify_log`; with those set the positional args are
+optional (precedence: defaults < config < CLI). Each finalized transfer appends a structured verdict
+line to **`verify.log`** (`<ts> <path> bytes=… verdict=ok|corrupt reason=ok|decode|checksum|size|eviction`).
+A sandboxed **systemd unit** and an annotated `receiver.conf.example` ship in the repo.
 
 A tight **capture loop** parses each datagram, **routes it to its transfer by FILEID**, and
 accumulates it into a pre-allocated group decoder state — never decoding inline. A separate
@@ -185,9 +191,10 @@ How the harder obligations were closed:
 - **Phase 1 — proven codec core** ✅ AoRTE-clean incl. the peeling decoder
 - **Phase 2 — `sender_stream`** ✅ proven wire format + stdin framing, single-port emit, UDP, pacing,
   CLI; verified byte-exact over loopback
-- **Phase 3 — `receiver_stream`** ✅ *daemon done*: decoupled capture/decode, parallel per-FILEID
-  transfers, **`recvmmsg` batching**, `O_EXCL|O_NOFOLLOW` writes, checksum gate, eviction, `--pipe`,
-  byte-exact end-to-end. *Remaining parity:* config file, `verify.log` journal
+- **Phase 3 — `receiver_stream`** ✅ *done*: decoupled capture/decode, parallel per-FILEID transfers,
+  **`recvmmsg` batching**, `O_EXCL|O_NOFOLLOW` writes, checksum gate, eviction, `--pipe`, **config
+  file + `verify.log` journal + systemd unit**, byte-exact end-to-end. *Minor remaining:* timestamped
+  levelled logging (`--syslog`/`--log`), runtime `--max-inflight`/`--evict-timeout`
 - **Phase 4 — integration** — loopback, simulated loss, multi-file, ENOSPC; reuse the systemd/init units
 - **Phase 5 — proof hardening** ✅ codec core fully proved AoRTE (0 unproved, 0 justified); the
   remaining assurance task is documenting the trusted I/O boundary once Phases 2–3 land

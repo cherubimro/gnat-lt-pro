@@ -1,0 +1,60 @@
+# gnat-lt-pro one-way LT fountain-code receiver, as a sandboxed systemd service.
+#
+# Install:
+#   install -m644 systemd/lt-diode-receiver.service /etc/systemd/system/
+#   install -d /etc/lt-diode
+#   install -m640 receiver.conf.example /etc/lt-diode/receiver.conf
+#   $EDITOR /etc/lt-diode/receiver.conf     # set port/seed and
+#                                           #   spool = /var/lib/lt-diode/incoming
+#   systemctl daemon-reload && systemctl enable --now lt-diode-receiver
+#
+# This port uses a SINGLE UDP port (the part_no range disambiguates packet roles),
+# not the C reference's three.  Keep `port` >= 1024 so no capability is needed.
+#
+# Throughput: for line-rate reception raise the socket buffer ceiling, e.g.
+#   sysctl -w net.core.rmem_max=134217728
+# (the receiver already requests a large SO_RCVBUF and batches with recvmmsg).
+
+[Unit]
+Description=gnat-lt-pro one-way LT fountain-code receiver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust the path to wherever bin/receiver_stream was installed.
+ExecStart=/usr/local/bin/receiver_stream --config /etc/lt-diode/receiver.conf
+Restart=on-failure
+RestartSec=2
+
+# --- run unprivileged with an ephemeral user; systemd creates + owns these dirs ---
+DynamicUser=yes
+StateDirectory=lt-diode
+LogsDirectory=lt-diode
+ExecStartPre=/bin/mkdir -p /var/lib/lt-diode/incoming
+
+# --- sandbox / hardening ---
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

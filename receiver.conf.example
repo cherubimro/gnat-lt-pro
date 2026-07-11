@@ -1,0 +1,31 @@
+# =============================================================================
+# gnat-lt-pro receiver_stream daemon configuration (example)
+# =============================================================================
+# Format: one `key = value` per line; `#` starts a comment; surrounding
+# whitespace is trimmed.  Copy to e.g. /etc/lt-diode/receiver.conf and start:
+#
+#     receiver_stream --config /etc/lt-diode/receiver.conf
+#
+# PRECEDENCE (low -> high):  built-in defaults  <  this file  <  positional CLI
+# args.  With port/spool/seed all set here the positional args are optional.
+# =============================================================================
+
+# --- Transport ---------------------------------------------------------------
+# UDP port to listen on (single port; this port unifies what the C reference
+# split across three).  Must match the sender.  REQUIRED.
+port = 9000
+
+# Shared LT seed.  MUST be identical on the sender and receiver.  REQUIRED.
+seed = 42
+
+# Expected channel loss %, for CLI parity with the sender.  The receiver decodes
+# from whatever arrives, so this is informational here.
+loss = 30
+
+# --- Spool / output ----------------------------------------------------------
+# Directory the decoded output files, their .finished / .corrupt markers, and
+# verify.log live in.  REQUIRED.
+spool = /var/lib/lt-diode/incoming
+
+# Path of the per-transfer verdict journal.  Default: <spool>/verify.log
+# verify_log = /var/log/lt-diode/verify.log
