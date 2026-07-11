@@ -23,18 +23,18 @@ with Lt_Decoder_Std;
 procedure Test_Codec is
 
    K         : constant := Lt_Types.K;
-   --  Provision coding packets so the *received* count targets ~1.5 x K after
-   --  loss (mirrors the sender's N_send = ceil(N_needed / (1 - loss)) scaling).
-   Recv_Num  : constant := 3;                   --  target received = 3/2 * K
-   Recv_Den  : constant := 2;
-   Max_Coded : constant := 12_000;              --  cap (enough for 30% at 1.5x)
+   --  Pure LT coding: emit enough coding packets that the received count targets
+   --  ~1.25 x K after loss (comfortably above the ~1.15x decode threshold).
+   Recv_Num  : constant := 5;                   --  target received = 5/4 * K
+   Recv_Den  : constant := 4;
+   Max_Coded : constant := 18_000;              --  cap (enough for 30% at 1.25x)
 
    --  Coding packets to emit at a given loss so received ~= Recv_Num/Recv_Den*K.
    function Coded_For (Loss_Pct : Natural) return Natural is
       Total : constant Natural :=
         (Recv_Num * K * 100) / (Recv_Den * (100 - Loss_Pct));
    begin
-      return Natural'Min (Max_Coded, (if Total > K then Total - K else 0));
+      return Natural'Min (Max_Coded, Total);
    end Coded_For;
 
    --  Use the proved concrete instance (Max_Packets => 20_000, Max_Edges => 600_000).
@@ -84,15 +84,6 @@ procedure Test_Codec is
       end loop;
 
       Dec.Reset (St.all);
-
-      --  Clear packets (degree 1).
-      for S in 0 .. K - 1 loop
-         if not Dropped then
-            Ids (1) := S;
-            Dec.Add_Packet (St.all, 1, Ids, Src (S), Ok);
-            if Ok then Recvd := Recvd + 1; end if;
-         end if;
-      end loop;
 
       --  Coding packets: encode, lose some, and re-derive the index set on the
       --  receiver side purely from the seed (as the real receiver will).

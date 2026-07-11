@@ -556,19 +556,16 @@ procedure Receiver_Stream is
          C_Have (Slot) := True;
       end if;
 
-      if Part < U32 (K) then
-         Ids (1) := Natural (Part);
-         Dec.Add_Packet (Pool_State (C_Idx (Slot)).all, 1, Ids, Payload, Ok);
-      else
-         declare
-            Idx   : constant Natural := Natural (Part) - K;
-            CSeed : constant U64 :=
-              Lt_Rng.Coding_Seed (Seed, U64 (Group), U64 (Idx));
-         begin
-            Lt_Sample.Sample_Indices (CSeed, Deg, Ids);
-            Dec.Add_Packet (Pool_State (C_Idx (Slot)).all, Deg, Ids, Payload, Ok);
-         end;
-      end if;
+      --  Pure LT coding: every data packet is a coding packet whose index is
+      --  part_no; re-derive its source set from the shared seed.
+      declare
+         Idx   : constant Natural := Natural (Part);
+         CSeed : constant U64 :=
+           Lt_Rng.Coding_Seed (Seed, U64 (Group), U64 (Idx));
+      begin
+         Lt_Sample.Sample_Indices (CSeed, Deg, Ids);
+         Dec.Add_Packet (Pool_State (C_Idx (Slot)).all, Deg, Ids, Payload, Ok);
+      end;
       C_Last_Ms (Slot) := Now_Ms;
    end Handle;
 

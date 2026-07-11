@@ -12,10 +12,9 @@ with Lt_Types;
 --     [ 112 .. 115]  part_no      (u32)  role, see below
 --     [ 116 ..1471]  data         (1356 payload bytes)
 --
---  part_no roles (single-port design; the range disambiguates, so no need for
---  the C reference's three consecutive ports):
---     0 .. K-1        clear packet -- payload is source symbol `part_no`
---     K .. Eot-1      coding packet -- coding index is (part_no - K)
+--  part_no roles (pure LT coding, single port):
+--     0 .. Eot-1      coding packet -- part_no is the coding index; the seed is
+--                     derived from (SEED, group_no, part_no)
 --     Part_Eot        end-of-transfer trailer -- file_size = total bytes,
 --                     group_no = total group count, data = whole-stream checksum
 --

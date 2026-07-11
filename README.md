@@ -59,7 +59,7 @@ storage, so any heap lives only in the trusted shell and the bounds stay provabl
 |---|---|
 | `lt_types` | Symbol/byte types, group geometry (`K = 7375`, `Data_Len = 1356`), `Xor_Into` |
 | `lt_rng` | SplitMix64 generator; uniform draws; no global state |
-| `lt_soliton` | Robust Soliton cumulative table (frozen constants) + inverse-CDF degree sampler |
+| `lt_soliton` | Robust Soliton cumulative table (frozen constants, spike `c=0.015` tuned for low overhead) + inverse-CDF degree sampler |
 | `lt_sample` | Seed → degree + distinct source-index set (partial Fisher–Yates) — the one routine both ends must agree on |
 | `lt_encoder` | Build one XOR coding symbol from a group + seed |
 | `lt_decoder` | Generic peeling (belief-propagation) decoder over a caller-sized incidence store |
@@ -87,11 +87,17 @@ cat payload | sender_stream [--progress] [--pace-us N] <IP> <port> <SEED> <name>
 ```
 
 Reads the payload from **stdin**, splits it into group-local ~10 MB groups, and emits over one UDP
-port a fountain stream of `K` degree-1 *clear* packets plus loss-scaled XOR *coding* packets per
-group, then a 5×-repeated end-of-transfer trailer carrying the exact size, group count and
+port a **pure LT fountain stream** — loss-scaled XOR coding packets per group (no systematic clear
+channel) — then a 5×-repeated end-of-transfer trailer carrying the exact size, group count and
 whole-stream checksum. `SEED` and `loss%` must match the receiver. `--pace-us` throttles the send
 (a real diode is paced by network backpressure; loopback is not). Coding packets carry only their
 index — both ends derive the packet seed from `(SEED, group, index)` with `Lt_Rng.Coding_Seed`.
+
+The degree distribution's spike constant (`c=0.015`, `lt_soliton`) was tuned empirically
+(`tests/test_overhead`) so the receiver decodes reliably at **~1.15× K** received; the sender
+provisions to ~1.25× after loss. Pure coding at this `c` is markedly more efficient than a
+systematic clear+coding scheme, which the tuned distribution pushes to >1.4× — so the clear channel
+was dropped, cutting sender traffic ~17% versus the earlier 1.5× target and simplifying both ends.
 
 ### Receiver
 

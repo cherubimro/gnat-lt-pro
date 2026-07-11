@@ -112,16 +112,15 @@ procedure Sender_Stream is
       Coded : Lt_Types.Symbol;
       CSeed : Unsigned_64;
    begin
-      for S in 0 .. K - 1 loop
-         Lt_Wire.Serialize (Name, 0, Group_No, U32 (S), Grp (S), Buf);
-         Send_Buf (Buf);
-      end loop;
-
+      --  Pure LT coding (no systematic clear channel): the tuned c=0.015
+      --  distribution decodes at ~1.15x K, which is far more efficient than the
+      --  clear+coding scheme (>1.4x) with this distribution.  part_no is simply
+      --  the coding index; the receiver derives the seed from (SEED, group, idx).
       for Idx in 0 .. N_Coding - 1 loop
          CSeed := Lt_Rng.Coding_Seed (Seed, Unsigned_64 (Group_No),
                                       Unsigned_64 (Idx));
          Lt_Encoder.Encode_Symbol (Grp.all, CSeed, Deg, Ids, Coded);
-         Lt_Wire.Serialize (Name, 0, Group_No, U32 (K + Idx), Coded, Buf);
+         Lt_Wire.Serialize (Name, 0, Group_No, U32 (Idx), Coded, Buf);
          Send_Buf (Buf);
       end loop;
    end Emit_Group;
@@ -221,15 +220,14 @@ begin
          Die ("loss% must be in 0 .. 90");
       end if;
 
-      --  Coding packets so that after `loss` the receiver still gets ~1.5 x K
-      --  packets (the overhead this codec's peeling needs to decode reliably;
-      --  clear packets alone cover the loss-free case).
+      --  Emit enough coding packets that after `loss` the receiver still gets
+      --  ~1.25 x K (comfortably above the tuned distribution's ~1.15x decode
+      --  threshold; see tests/test_overhead).
       declare
          L        : constant Float := Float (Loss_Pct) / 100.0;
-         Recv_Tgt : constant Float := 1.5 * Float (K);
-         Sent_Tgt : constant Natural := Natural (Recv_Tgt / (1.0 - L));
+         Recv_Tgt : constant Float := 1.25 * Float (K);
       begin
-         N_Coding := (if Sent_Tgt > K then Sent_Tgt - K else 0);
+         N_Coding := Natural (Recv_Tgt / (1.0 - L));
       end;
 
       --  Connect the datagram socket.

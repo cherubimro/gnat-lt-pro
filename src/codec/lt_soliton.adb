@@ -4,12 +4,15 @@ package body Lt_Soliton is
 
    K : constant := Lt_Types.K;
 
-   --  Frozen transcendental scalars (see spec).  Computed once as
-   --    R   = 0.07 * ln(7375/0.001) * sqrt(7375)
+   --  Frozen transcendental scalars (see spec).  The spike constant c = 0.015
+   --  was tuned empirically (tests/test_overhead) to minimise decode overhead:
+   --  it decodes reliably at ~1.15x K received, vs ~1.25x for the C reference's
+   --  c = 0.07.  Computed once as
+   --    R   = 0.015 * ln(7375/0.001) * sqrt(7375)
    --    LRD = ln(R / 0.001)
-   R     : constant Long_Float := 95.06266364627775545;
-   LRD   : constant Long_Float := 11.46229157046002456;
-   Pivot : constant := 77;                          --  floor(K / R)
+   R     : constant Long_Float := 20.37057078134522925;
+   LRD   : constant Long_Float := 9.92184652951287660;
+   Pivot : constant := 362;                         --  floor(K / R)
 
    Kf : constant Long_Float := Long_Float (K);
 

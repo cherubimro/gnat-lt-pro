@@ -72,19 +72,15 @@ procedure Udp_Decode_Sink is
          return;
       end if;
 
-      if Part < Unsigned_32 (K) then                     --  clear packet
-         Ids (1) := Natural (Part);
-         Dec.Add_Packet (States (G).all, 1, Ids, Payload, Ok);
-      else                                               --  coding packet
-         declare
-            Idx   : constant Natural := Natural (Part) - K;
-            CSeed : constant Unsigned_64 :=
-              Lt_Rng.Coding_Seed (Seed, Unsigned_64 (Group), Unsigned_64 (Idx));
-         begin
-            Lt_Sample.Sample_Indices (CSeed, Deg, Ids);
-            Dec.Add_Packet (States (G).all, Deg, Ids, Payload, Ok);
-         end;
-      end if;
+      --  Pure LT coding: part_no is the coding index.
+      declare
+         Idx   : constant Natural := Natural (Part);
+         CSeed : constant Unsigned_64 :=
+           Lt_Rng.Coding_Seed (Seed, Unsigned_64 (Group), Unsigned_64 (Idx));
+      begin
+         Lt_Sample.Sample_Indices (CSeed, Deg, Ids);
+         Dec.Add_Packet (States (G).all, Deg, Ids, Payload, Ok);
+      end;
    end Add;
 
 begin
