@@ -127,11 +127,22 @@ a wire.** It needs no root precisely *because* it bypasses nothing.
 | `af_packet` (`--vdev=net_af_packet0,iface=eth0`) | no, with `setcap cap_net_raw,cap_net_admin+ep` | **no** — frames still traverse the kernel |
 | `vfio-pci` (true bypass) | **yes, for setup** | **yes** |
 
-True bypass needs, once, as root: an IOMMU (`intel_iommu=on`, BIOS + reboot), hugepages, and
-`dpdk-devbind.py -b vfio-pci <addr>` on a **spare** NIC — a bound NIC *disappears from the kernel*,
-so never bind the one carrying your SSH session. The *runtime* can then be non-root (chown
-`/dev/vfio/<group>`, a writable hugepage mount, a raised `RLIMIT_MEMLOCK`); without an IOMMU,
-`noiommu` mode needs `CAP_SYS_RAWIO` — effectively root, and genuinely unsafe (unrestricted DMA).
+True bypass needs, once, as root: an IOMMU (`intel_iommu=on`, BIOS + reboot), hugepages, and a
+**spare** NIC bound to `vfio-pci` — a bound NIC *disappears from the kernel*, so never bind the one
+carrying your SSH session. `tools/vfio-setup.sh` does this and **refuses** to bind your default-route
+or SSH card, refuses a card DPDK has no PMD for, and checks the IOMMU group is viable first:
+
+```sh
+./tools/vfio-setup.sh status              # no root; shows PMD per card, marks DO NOT BIND
+./tools/vfio-setup.sh check               # IOMMU / vfio / hugepages preflight
+sudo ./tools/vfio-setup.sh hugepages 512
+sudo ./tools/vfio-setup.sh bind   eno2    # the spare Intel card
+sudo ./tools/vfio-setup.sh unbind eno2    # give it back to the kernel
+```
+
+The *runtime* can then be non-root (`bind` chowns `/dev/vfio/<group>` to the invoking user); without
+an IOMMU, `noiommu` mode needs `CAP_SYS_RAWIO` — effectively root, and genuinely unsafe
+(unrestricted DMA).
 
 **The vendored DPDK in `../dpdk/deps` cannot do it as shipped.** It was built with
 `-Denable_drivers=bus/vdev,...,net/memif` — no PCI NIC PMD at all, so a binary linked against it has

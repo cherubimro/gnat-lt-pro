@@ -160,48 +160,69 @@
  2. SET IT UP  (as root, once per machine, survives until reboot)
 ===============================================================================
 
- 2.1  Hugepages.  DPDK allocates its packet buffers from these.
+ Use tools/vfio-setup.sh.  It does the same thing as the manual steps in 2.6
+ below, but it REFUSES to bind the card carrying your default route or your SSH
+ session, refuses a card DPDK has no PMD for, and checks the IOMMU group is
+ viable before it touches anything.  Those are the three ways people lose a
+ machine or waste an afternoon.
+
+ 2.1  Look at what you have.  (No root needed, changes nothing.)
+
+          ./tools/vfio-setup.sh status
+
+      Example:
+
+          PCI            IFACE     DRIVER    IOMMU  VENDOR:DEV  DPDK PMD
+          0000:02:00.0   eno1      e1000e    12     8086:15fb   e1000    <-- DO NOT BIND (default route / SSH)
+          0000:03:00.0   eno2      ixgbe     17     8086:10fb   ixgbe
+
+      Bind only a card with a real PMD (ixgbe / i40e / ice / e1000) and no
+      "DO NOT BIND" marker.  A PMD of "?" means DPDK has no driver for that
+      card and binding it is pointless -- you would get "no ethdev port
+      available".
+
+ 2.2  Preflight.
+
+          ./tools/vfio-setup.sh check
+
+      Tells you whether the IOMMU is on, whether vfio-pci is available, whether
+      hugepages exist, and whether any card has a usable PMD.  Fix whatever it
+      complains about before going on.
+
+ 2.3  Hugepages.  DPDK allocates its packet buffers from these.
+
+          sudo ./tools/vfio-setup.sh hugepages 512      # 512 x 2MB = 1 GB
+
+      To survive a reboot, add to /etc/sysctl.conf:   vm.nr_hugepages = 512
+
+ 2.4  Bind the SPARE card.
+
+          sudo ./tools/vfio-setup.sh bind eno2          # or: bind 0000:03:00.0
+
+      It loads vfio-pci, records the current kernel driver so it can be undone,
+      takes the interface down, and hands the device to vfio-pci.  If you point
+      it at your SSH card it will refuse; --force overrides, and you should only
+      ever use that from a console you can physically reach.
+
+      If your user invoked it via sudo, it also chowns /dev/vfio/<group> to you,
+      so the daemon itself can then run WITHOUT root (see section 5).
+
+      The interface now disappears from `ip link`.  That is correct.  That is
+      what kernel bypass means.
+
+ 2.5  Repeat 2.1 - 2.4 on the SECOND machine.
+
+ 2.6  (Reference) The same thing by hand, if you prefer or if the script cannot
+      run.  This is exactly what it does:
 
           echo 512 | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
-
-      That is 512 x 2 MB = 1 GB.  Check it took:
-
-          grep Huge /proc/meminfo
-
-      To make it survive a reboot, add to /etc/sysctl.conf:
-
-          vm.nr_hugepages = 512
-
- 2.2  Load the vfio-pci driver.
-
           sudo modprobe vfio-pci
-
- 2.3  Find the SPARE NIC's PCI address.
-
-          sudo dpdk-devbind.py --status-dev net
-
-      Output looks like:
-
-          0000:03:00.0 'I210 Gigabit Network Connection' if=eno2 drv=igb unused=vfio-pci
-          0000:02:00.0 'I219-LM'                          if=eno1 drv=e1000e unused=vfio-pci  *Active*
-
-      The one marked *Active* is almost certainly your SSH link.  DO NOT BIND
-      THAT ONE.  Here we take eno2 = 0000:03:00.0.
-
- 2.4  Bind it to vfio-pci.
-
+          sudo dpdk-devbind.py --status-dev net       # find the spare NIC
           sudo ip link set eno2 down
           sudo dpdk-devbind.py -b vfio-pci 0000:03:00.0
 
-      Confirm.  It should now appear under "Network devices using DPDK-compatible
-      driver" and have NO "if=" name:
-
-          sudo dpdk-devbind.py --status-dev net
-
-      The interface is now gone from `ip link`.  That is correct and expected.
-      That is what kernel bypass means.
-
- 2.5  Repeat 2.1 - 2.4 on the SECOND machine.
+      The card marked *Active* in dpdk-devbind's output is almost certainly your
+      SSH link.  DO NOT BIND THAT ONE.
 
 
 ===============================================================================
@@ -247,12 +268,18 @@
  4. GIVING THE NIC BACK TO THE KERNEL
 ===============================================================================
 
-      sudo dpdk-devbind.py -b e1000e 0000:03:00.0      # or igb / ixgbe / i40e
-      sudo ip link set eno2 up
+      sudo ./tools/vfio-setup.sh unbind 0000:03:00.0        # or: unbind eno2
 
- Use the driver name the card had originally -- the "drv=" field you saw in
- step 2.3 before you bound it.  If you forget which, `lspci -k -s 03:00.0`
- lists "Kernel modules:" for that device.
+ The script remembered which kernel driver the card had before you bound it (it
+ saved it in /var/lib/lt-diode/vfio.state), so it rebinds the right one and
+ brings the interface back up.
+
+ By hand, if you must -- you need the ORIGINAL driver name, the "drv=" field
+ from before the bind.  If you have forgotten it, `lspci -k -s 03:00.0` lists
+ "Kernel modules:" for that device:
+
+      sudo dpdk-devbind.py -b ixgbe 0000:03:00.0
+      sudo ip link set eno2 up
 
 
 ===============================================================================
