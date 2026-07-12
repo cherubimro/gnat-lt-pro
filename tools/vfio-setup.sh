@@ -54,17 +54,28 @@ pci_group () {
     [ -n "$g" ] && basename "$g" || echo "-"
 }
 
-# Which DPDK PMD claims this device?  Ask the DPDK source, do not guess: the
-# device id appears in the PMD's own id table.
+# Which DPDK PMD claims this device?  Never guess -- a wrong answer here means
+# binding a card DPDK cannot drive.
+#
+# Primary source is tools/pmd-ids.txt, generated from DPDK's own id tables by
+# tools/gen-pmd-ids.sh.  It is a plain file precisely so this works on a machine
+# that has the pre-built binaries but no DPDK source and no toolchain.  If the
+# source tree IS present we fall back to grepping it directly.
+IDS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pmd-ids.txt"
+
 which_pmd () {
-    local dev="${1#0x}" p
-    [ -d "$DPDK_SRC/drivers/net" ] || { echo "?"; return; }
-    for p in ixgbe i40e ice e1000; do
-        # grep -l, and we drain it: no `grep -q` here (see the SIGPIPE note below)
-        if [ -n "$(grep -rlis "0x$dev" "$DPDK_SRC/drivers/net/$p/" 2>/dev/null | head -1)" ]; then
-            echo "$p"; return
-        fi
-    done
+    local ven="${1#0x}" dev="${2#0x}" p hit
+    if [ -r "$IDS" ]; then
+        hit="$(awk -v k="$ven:$dev" '$1==k {print $2; exit}' "$IDS")"
+        [ -n "$hit" ] && { echo "$hit"; return; }
+    fi
+    if [ -d "$DPDK_SRC/drivers/net" ]; then
+        for p in ixgbe i40e ice e1000; do
+            if [ -n "$(grep -rlis "0x$dev" "$DPDK_SRC/drivers/net/$p/" 2>/dev/null | head -1)" ]; then
+                echo "$p"; return
+            fi
+        done
+    fi
     echo "?"
 }
 
@@ -92,7 +103,7 @@ cmd_status () {
         pci="$(basename "$d")"
         drv="$(pci_driver "$pci")"; ifc="$(pci_iface "$pci")"; grp="$(pci_group "$pci")"
         ven="$(pci_attr "$pci" vendor)"; dev="$(pci_attr "$pci" device)"
-        pmd="$(which_pmd "$dev")"
+        pmd="$(which_pmd "$ven" "$dev")"
         printf '%-14s %-9s %-9s %-6s %-11s %s' \
             "$pci" "${ifc:--}" "$drv" "$grp" "${ven#0x}:${dev#0x}" "$pmd"
         case " $danger " in *" ${ifc:-__none__} "*) printf '   <-- DO NOT BIND (default route / SSH)';; esac
@@ -214,7 +225,7 @@ cmd_bind () {
     fi
 
     [ "${ven#0x}" = "8086" ] || warn "not an Intel card -- DPDK may have no PMD for it"
-    pmd="$(which_pmd "$dev")"
+    pmd="$(which_pmd "$ven" "$dev")"
     if [ "$pmd" = "?" ]; then
         warn "no DPDK 22.11 PMD matches device ${ven#0x}:${dev#0x}."
         warn "Binding it will succeed and then DPDK will report 'no ethdev port available'."

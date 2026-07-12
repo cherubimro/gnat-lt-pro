@@ -62,16 +62,25 @@ pci_driver () {
     [ -n "$d" ] && basename "$d" || echo "-"
 }
 
-# Which PMD does this card need?  Ask the DPDK source's own id tables.
+# Which PMD does this card need?  From tools/pmd-ids.txt, generated out of DPDK's
+# own id tables (tools/gen-pmd-ids.sh) -- a plain file, so this still works on a
+# machine that has only the copied binaries: no DPDK source, no toolchain.
 pmd_for () {
-    local dev p src="$here/../../dpdk/deps/dpdk-stable-22.11.9"
+    local ven dev p hit src="$here/../../dpdk/deps/dpdk-stable-22.11.9"
+    ven="$(cat "/sys/bus/pci/devices/$1/vendor" 2>/dev/null)"; ven="${ven#0x}"
     dev="$(cat "/sys/bus/pci/devices/$1/device" 2>/dev/null)"; dev="${dev#0x}"
-    [ -d "$src/drivers/net" ] || { echo "?"; return; }
-    for p in ixgbe i40e ice e1000; do
-        if [ -n "$(grep -rlis "0x$dev" "$src/drivers/net/$p/" 2>/dev/null | head -1)" ]; then
-            echo "$p"; return
-        fi
-    done
+
+    if [ -r "$here/pmd-ids.txt" ]; then
+        hit="$(awk -v k="$ven:$dev" '$1==k {print $2; exit}' "$here/pmd-ids.txt")"
+        [ -n "$hit" ] && { echo "$hit"; return; }
+    fi
+    if [ -d "$src/drivers/net" ]; then
+        for p in ixgbe i40e ice e1000; do
+            if [ -n "$(grep -rlis "0x$dev" "$src/drivers/net/$p/" 2>/dev/null | head -1)" ]; then
+                echo "$p"; return
+            fi
+        done
+    fi
     echo "?"
 }
 
