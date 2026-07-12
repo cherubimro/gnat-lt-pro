@@ -30,6 +30,16 @@ spool = /var/lib/lt-diode/incoming
 # Path of the per-transfer verdict journal.  Default: <spool>/verify.log
 # verify_log = /var/log/lt-diode/verify.log
 
+# --- Parallelism / timeouts --------------------------------------------------
+# Max concurrent transfers (distinct FILEIDs) decoding at once; clamped to the
+# compile-time ceiling (16).  The group-state pool (~32 MB/state, ~2x this) is
+# allocated at start-up, so raising this raises RAM.  Default 3.  --max-inflight.
+# max_inflight = 3
+
+# Seconds of inactivity before a stalled transfer (lost trailer) is evicted as
+# .corrupt.  Default 10.  --evict-timeout.
+# evict_timeout = 10
+
 # --- Operational logging (timestamp + level) ---------------------------------
 # Where the [rs] operational lines go: stderr (default; journald timestamps it
 # under systemd) | file | syslog.  --syslog / --log <file> on the CLI override.

@@ -31,9 +31,14 @@ with Lt_Log;
 --  gate.  Up to Max_Inflight transfers decode concurrently, each finalizing
 --  independently; a stalled transfer is evicted without disturbing the others.
 --
---  Usage: receiver_stream [--pipe] [--progress] <port> <spool> <SEED> <loss%>
+--  Usage: receiver_stream [--pipe] [--progress] [--config <file>]
+--         [--max-inflight <n>] [--evict-timeout <s>]
+--         [<port> <spool> <SEED> <loss%>]
 --    * file mode loops forever (a daemon); --pipe handles one transfer to stdout
 --      then exits with the verdict as its exit code.
+--    * max_inflight / evict_timeout are runtime-tunable (config or CLI), clamped
+--      to the compile-time Max_Inflight_Cap; the group-state pool is allocated at
+--      the resolved depth on start-up.
 procedure Receiver_Stream is
 
    K            : constant := Lt_Types.K;
@@ -54,10 +59,18 @@ procedure Receiver_Stream is
    type Group_Ptr is access Lt_Types.Symbol_Array;
    type State_Ptr is access Dec.State;
 
-   Max_Inflight : constant := 3;                 --  concurrent transfers
-   Pool_N       : constant := 6;                 --  shared group-state pool
-   Ring_N       : constant := Pool_N + 2;
-   Evict_Ms     : constant := 10_000;            --  stalled-transfer eviction
+   --  Compile-time ceilings that size the fixed arrays; the runtime depth is
+   --  clamped to these.  Each pooled group state is ~32 MB, so the pool cap
+   --  bounds worst-case RAM (2 * 16 + 2 = 34 states ~ 1 GB at the ceiling).
+   Max_Inflight_Cap : constant := 16;            --  max concurrent transfers
+   Pool_N           : constant := 2 * Max_Inflight_Cap + 2;  --  group-state cap
+   Ring_N           : constant := Pool_N + 2;
+
+   --  Runtime-tunable via config (max_inflight / evict_timeout) or CLI
+   --  (--max-inflight / --evict-timeout); resolved at start-up.
+   Max_Inflight : Natural := 3;                  --  transfer slots actually used
+   Pool_Use     : Natural := 8;                  --  group states allocated
+   Evict_Ms     : U64     := 10_000;             --  stalled-transfer eviction (ms)
 
    --  Hardened output open() flags.
    O_WRONLY   : constant := 1;
@@ -122,6 +135,10 @@ procedure Receiver_Stream is
    Log_File  : Unbounded_String  := Null_Unbounded_String;
    Log_Level : Lt_Log.Level_Type := Lt_Log.Info;
    Log_Cli   : Boolean := False;                  --  a --syslog/--log given
+
+   --  CLI overrides for the runtime tunables (-1 = not given on the CLI).
+   MI_Cli : Integer := -1;                         --  --max-inflight
+   ET_Cli : Integer := -1;                         --  --evict-timeout (seconds)
 
    Epoch : constant Ada.Real_Time.Time := Ada.Real_Time.Clock;
    function Now_Ms return U64 is
@@ -211,10 +228,11 @@ procedure Receiver_Stream is
    --  reuses a slot whose previous transfer is still being written.
    ---------------------------------------------------------------------------
    type Slot_Status is (Free, Active, Draining);
-   type Status_Array is array (1 .. Max_Inflight) of Slot_Status;
-   type Id_Array     is array (1 .. Max_Inflight) of Lt_Wire.Name_String;
+   type Status_Array is array (1 .. Max_Inflight_Cap) of Slot_Status;
+   type Id_Array     is array (1 .. Max_Inflight_Cap) of Lt_Wire.Name_String;
 
    protected Slots is
+      procedure Set_Limit (N : Natural);          --  runtime depth (<= cap)
       procedure Route (Raw : Lt_Wire.Name_String;
                        Slot : out Natural; Is_New : out Boolean);
       function  Find  (Raw : Lt_Wire.Name_String) return Natural;
@@ -223,12 +241,18 @@ procedure Receiver_Stream is
    private
       Status : Status_Array := (others => Free);
       Ids    : Id_Array;
+      Limit  : Natural := Max_Inflight_Cap;
    end Slots;
 
    protected body Slots is
+      procedure Set_Limit (N : Natural) is
+      begin
+         Limit := N;
+      end Set_Limit;
+
       function Find (Raw : Lt_Wire.Name_String) return Natural is
       begin
-         for S in Status'Range loop
+         for S in 1 .. Limit loop
             if Status (S) = Active and then Ids (S) = Raw then
                return S;
             end if;
@@ -244,7 +268,7 @@ procedure Receiver_Stream is
             Is_New := False;
             return;
          end if;
-         for S in Status'Range loop
+         for S in 1 .. Limit loop
             if Status (S) = Free then
                Status (S) := Active;
                Ids (S) := Raw;
@@ -273,9 +297,9 @@ procedure Receiver_Stream is
    --  Per-transfer accumulation (checksum, bytes written, failure) lives in
    --  task-local arrays, so only this task touches them (no locking needed).
    ---------------------------------------------------------------------------
-   type Cksum_Array is array (1 .. Max_Inflight) of Lt_Types.Symbol;
-   type U64_Array   is array (1 .. Max_Inflight) of U64;
-   type Bool_Array  is array (1 .. Max_Inflight) of Boolean;
+   type Cksum_Array is array (1 .. Max_Inflight_Cap) of Lt_Types.Symbol;
+   type U64_Array   is array (1 .. Max_Inflight_Cap) of U64;
+   type Bool_Array  is array (1 .. Max_Inflight_Cap) of Boolean;
 
    --  Shared group-state pool (allocated in the main body; the decode task
    --  blocks on the job queue until the first group is posted, long after).
@@ -466,12 +490,12 @@ procedure Receiver_Stream is
    ---------------------------------------------------------------------------
    --  Capture-owned per-slot accumulation state (only the main task touches it).
    ---------------------------------------------------------------------------
-   type Grp_Array  is array (1 .. Max_Inflight) of U32;
-   type Idx_Array  is array (1 .. Max_Inflight) of Natural;
-   type CBool      is array (1 .. Max_Inflight) of Boolean;
-   type CFD        is array (1 .. Max_Inflight) of FD_Type;
-   type CU64       is array (1 .. Max_Inflight) of U64;
-   type CPath      is array (1 .. Max_Inflight) of Unbounded_String;
+   type Grp_Array  is array (1 .. Max_Inflight_Cap) of U32;
+   type Idx_Array  is array (1 .. Max_Inflight_Cap) of Natural;
+   type CBool      is array (1 .. Max_Inflight_Cap) of Boolean;
+   type CFD        is array (1 .. Max_Inflight_Cap) of FD_Type;
+   type CU64       is array (1 .. Max_Inflight_Cap) of U64;
+   type CPath      is array (1 .. Max_Inflight_Cap) of Unbounded_String;
 
    C_Group   : Grp_Array := (others => 0);
    C_Idx     : Idx_Array := (others => 0);
@@ -616,12 +640,8 @@ begin
       GNAT.OS_Lib.OS_Exit (3);
    end if;
 
-   for I in Pool_State'Range loop
-      Pool_State (I) := new Dec.State;
-      Sched.Release (I);
-   end loop;
-
-   --  CLI: [--pipe] [--progress] [--config <file>] [<port> <spool> <SEED> <loss%>]
+   --  CLI: [--pipe] [--progress] [--config <file>] [--max-inflight <n>]
+   --       [--evict-timeout <s>] [<port> <spool> <SEED> <loss%>]
    --  Precedence: built-in defaults < config file < the four positional args.
    declare
       Config_Path : Unbounded_String := Null_Unbounded_String;
@@ -655,6 +675,18 @@ begin
                begin
                   Ignore := Lt_Log.Parse_Level (Argument (Argi), Log_Level);
                end;
+            end if;
+         elsif Argument (Argi) = "--max-inflight" then
+            Argi := Argi + 1;
+            if Argi <= Argument_Count then
+               begin MI_Cli := Integer'Value (Argument (Argi));
+               exception when others => null; end;
+            end if;
+         elsif Argument (Argi) = "--evict-timeout" then
+            Argi := Argi + 1;
+            if Argi <= Argument_Count then
+               begin ET_Cli := Integer'Value (Argument (Argi));
+               exception when others => null; end;
             end if;
          end if;
          Argi := Argi + 1;
@@ -699,9 +731,39 @@ begin
          Lt_Log.Init (Log_Dest, To_String (Log_File), "[rs]",
                       "lt-diode-receiver", Log_Level);
 
+         --  Runtime depth + eviction timeout (CLI > config > default), then
+         --  allocate the group-state pool at the resolved depth.
+         if MI_Cli >= 0 then
+            Max_Inflight := MI_Cli;
+         elsif Lt_Conf.Has (Conf, "max_inflight") then
+            Max_Inflight := Lt_Conf.Get_Int (Conf, "max_inflight", Max_Inflight);
+         end if;
+         Max_Inflight := Integer'Max (1, Integer'Min (Max_Inflight, Max_Inflight_Cap));
+
+         declare
+            ET : Integer := -1;
+         begin
+            if ET_Cli >= 0 then
+               ET := ET_Cli;
+            elsif Lt_Conf.Has (Conf, "evict_timeout") then
+               ET := Lt_Conf.Get_Int (Conf, "evict_timeout", 10);
+            end if;
+            if ET >= 1 then
+               Evict_Ms := U64 (ET) * 1000;
+            end if;
+         end;
+
+         Pool_Use := Integer'Min (2 * Max_Inflight + 2, Pool_N);
+         Slots.Set_Limit (Max_Inflight);
+         for I in 1 .. Pool_Use loop
+            Pool_State (I) := new Dec.State;
+            Sched.Release (I);
+         end loop;
+
          if Nargs /= 0 and then Nargs /= 4 then
             Put_Line (Standard_Error,
               "[usage] receiver_stream [--pipe] [--progress] [--config <file>]"
+              & " [--max-inflight <n>] [--evict-timeout <s>]"
               & " [<port> <spool> <SEED> <loss%>]");
             GNAT.OS_Lib.OS_Exit (2);
          end if;
@@ -744,6 +806,7 @@ begin
               "listening on port " & Port_S
               & (if Pipe_Mode then "  (pipe mode)" else "  spool " & Spool_S)
               & "  max_inflight=" & Max_Inflight'Image
+              & "  evict_timeout=" & U64'Image (Evict_Ms / 1000) & "s"
               & "  batch=" & Batch'Image
               & (if Loaded then "  (config loaded)" else ""));
          end;
