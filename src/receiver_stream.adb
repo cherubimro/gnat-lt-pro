@@ -166,7 +166,9 @@ procedure Receiver_Stream is
 
    --  Pool + job-queue scheduler.
    protected Sched is
-      entry     Acquire (Idx : out Natural);
+      --  Non-blocking: the capture loop must never stall on the pool (a stall
+      --  would stop it draining the socket AND running eviction -> deadlock).
+      procedure Try_Acquire (Idx : out Natural; Got : out Boolean);
       procedure Release (Idx : Natural);
       procedure Post    (J : Job);
       entry     Take    (J : out Job);
@@ -183,11 +185,17 @@ procedure Receiver_Stream is
    end Sched;
 
    protected body Sched is
-      entry Acquire (Idx : out Natural) when Free_Cnt > 0 is
+      procedure Try_Acquire (Idx : out Natural; Got : out Boolean) is
       begin
-         Idx := Free_Stack (Free_Cnt);
-         Free_Cnt := Free_Cnt - 1;
-      end Acquire;
+         if Free_Cnt > 0 then
+            Idx := Free_Stack (Free_Cnt);
+            Free_Cnt := Free_Cnt - 1;
+            Got := True;
+         else
+            Idx := 0;
+            Got := False;
+         end if;
+      end Try_Acquire;
 
       procedure Release (Idx : Natural) is
       begin
@@ -330,13 +338,16 @@ procedure Receiver_Stream is
       D_Cksum : Cksum_Array := (others => Lt_Types.Zero_Symbol);
       D_Wrote : U64_Array   := (others => 0);
       D_Fail  : Bool_Array  := (others => False);
-      Ignore  : Integer;
-      pragma Unreferenced (Ignore);
+      D_WErr  : Bool_Array  := (others => False);   --  a write failed (ENOSPC/IO)
 
       procedure Emit (Buf : Group_Ptr; FD : FD_Type; N : Natural; Slot : Natural) is
+         R : Integer;
       begin
          if N > 0 then
-            Ignore := GNAT.OS_Lib.Write (FD, Buf.all'Address, N);
+            R := GNAT.OS_Lib.Write (FD, Buf.all'Address, N);
+            if R /= N then                          --  short write / error
+               D_WErr (Slot) := True;
+            end if;
             D_Wrote (Slot) := D_Wrote (Slot) + U64 (N);
          end if;
       end Emit;
@@ -353,6 +364,7 @@ procedure Receiver_Stream is
                D_Cksum (S) := Lt_Types.Zero_Symbol;
                D_Wrote (S) := 0;
                D_Fail  (S) := False;
+               D_WErr  (S) := False;
             end if;
 
             N_Bytes := (if J.Is_Last
@@ -379,6 +391,7 @@ procedure Receiver_Stream is
                declare
                   Ok : constant Boolean :=
                     not D_Fail (S) and then not J.Corrupt
+                    and then not D_WErr (S)
                     and then D_Cksum (S) = J.Trailer_Cksum
                     and then D_Wrote (S) = J.Total_Bytes;
                begin
@@ -399,6 +412,7 @@ procedure Receiver_Stream is
                   declare
                      Reason : constant String :=
                        (if J.Corrupt then "eviction"
+                        elsif D_WErr (S) then "write-error"
                         elsif D_Fail (S) then "decode"
                         elsif D_Wrote (S) /= J.Total_Bytes then "size"
                         elsif not Ok then "checksum"
@@ -573,6 +587,12 @@ procedure Receiver_Stream is
          return;
       end if;
 
+      --  Reject an out-of-range coding index (real ones are < ~20k; a hostile
+      --  or corrupt part_no >= 2**31 would otherwise overflow Natural below).
+      if Part >= 16#0010_0000# then                --  1 Mi
+         return;
+      end if;
+
       Slots.Route (Raw, Slot, Is_New);
       if Slot = 0 then
          return;                                  --  table full: drop
@@ -614,7 +634,14 @@ procedure Receiver_Stream is
       end if;
 
       if not C_Have (Slot) then
-         Sched.Acquire (C_Idx (Slot));
+         declare
+            Got : Boolean;
+         begin
+            Sched.Try_Acquire (C_Idx (Slot), Got);
+            if not Got then
+               return;                              --  pool busy: drop, retry next packet
+            end if;
+         end;
          Dec.Reset (Pool_State (C_Idx (Slot)).all);
          C_Group (Slot) := Group;
          C_Have (Slot) := True;
@@ -827,31 +854,51 @@ begin
    end loop;
    FD_C := Interfaces.C.int (GNAT.Sockets.To_C (Sock));
 
-   Capture :
-   loop
-      declare
-         --  Drain up to Batch datagrams in one syscall.  SO_RCVTIMEO bounds the
-         --  idle wait so eviction still ticks; NULL timeout avoids recvmmsg's
-         --  partial-batch timeout quirk.
-         R    : constant Interfaces.C.int :=
-           C_Recvmmsg (FD_C, Msgs'Address, Interfaces.C.unsigned (Batch),
-                       MSG_WAITFORONE, System.Null_Address);
-         Stop : Boolean;
-      begin
-         if R <= 0 then
-            if not (R < 0 and then Errno_Loc.all = E_INTR) then
-               Sweep_Evictions;                   --  timeout / no data: reap
+   declare
+      Last_Sweep : U64 := 0;
+   begin
+      Capture :
+      loop
+         declare
+            --  Drain up to Batch datagrams in one syscall (MSG_WAITFORONE:
+            --  return as soon as one is in hand).  SO_RCVTIMEO bounds the idle
+            --  wait.
+            R    : constant Interfaces.C.int :=
+              C_Recvmmsg (FD_C, Msgs'Address, Interfaces.C.unsigned (Batch),
+                          MSG_WAITFORONE, System.Null_Address);
+            Now  : constant U64 := Now_Ms;
+            Stop : Boolean;
+         begin
+            --  Reap stalled transfers at least once a second, whether or not
+            --  traffic is flowing (idle-only eviction would let a burst of
+            --  bogus FILEIDs hold slots indefinitely under load).
+            if Now - Last_Sweep >= 1000 then
+               Sweep_Evictions;
+               Last_Sweep := Now;
             end if;
-         else
-            for I in 1 .. Natural (R) loop
-               if Msgs (I).Len = Lt_Wire.Max_Buf_Len then
-                  Handle (Bufs (I), Stop);
-                  exit Capture when Stop;
-               end if;
-            end loop;
-         end if;
-      end;
-   end loop Capture;
+
+            if R <= 0 then
+               null;                               --  timeout / EINTR: loop
+            else
+               for I in 1 .. Natural (R) loop
+                  if Msgs (I).Len = Lt_Wire.Max_Buf_Len then
+                     --  Defence in depth: no single (possibly hostile) datagram
+                     --  may ever take down the capture loop.
+                     begin
+                        Handle (Bufs (I), Stop);
+                        exit Capture when Stop;
+                     exception
+                        when E : others =>
+                           Lt_Log.Log (Lt_Log.Error,
+                             "dropped packet on exception: "
+                             & Exception_Message (E));
+                     end;
+                  end if;
+               end loop;
+            end if;
+         end;
+      end loop Capture;
+   end;
 
    if Pipe_Mode then
       declare

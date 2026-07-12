@@ -11,7 +11,7 @@ project Lt_Diode is
    for Exec_Dir    use "bin";
    for Main        use ("test_codec.adb", "sender_stream.adb",
                         "udp_decode_sink.adb", "receiver_stream.adb",
-                        "test_overhead.adb");
+                        "test_overhead.adb", "evil_send.adb");
 
    package Compiler is
       --  -gnat2022 : Ada 2022 (for the newer contract/quantifier syntax).

@@ -76,8 +76,9 @@ Toolchain: **GNAT 14.2.0 + gprbuild 24 + gnatprove** (SPARK). `tools/env.sh` put
 ./tools/build.sh           # gprbuild -> bin/{test_codec,sender_stream,receiver_stream,udp_decode_sink}
 ./bin/test_codec           # in-memory round-trip test matrix
 ./tools/prove.sh           # gnatprove over the whole SPARK core (incl. lt_wire)
-./tools/receiver-test.sh   # end-to-end: sender_stream -> receiver_stream (file + pipe)
+./tools/receiver-test.sh   # end-to-end: sender_stream -> receiver_stream (file + pipe + parallel)
 ./tools/loopback-test.sh   # end-to-end: sender_stream -> decode sink, byte-compared
+./tools/stress-test.sh     # adversarial soak of the trusted shell (attacks + floods + scale)
 ```
 
 ### Sender
@@ -196,8 +197,13 @@ How the harder obligations were closed:
   (runtime **`--max-inflight`**), **`recvmmsg` batching**, `O_EXCL|O_NOFOLLOW` writes, checksum gate,
   runtime-tunable **`--evict-timeout`** eviction, `--pipe`, config file + `verify.log` journal +
   systemd unit, timestamped/levelled logging (stderr/file/syslog), byte-exact end-to-end
-- **Phase 4 — integration** — end-to-end tests wired into `tools/check.sh` (build + proof +
-  in-memory matrix + file/pipe/parallel receiver + loopback); larger-scale / ENOSPC stress still open
+- **Phase 4 — integration & hardening** ✅ `tools/check.sh` (build + proof + in-memory matrix +
+  file/pipe/parallel receiver + loopback) and `tools/stress-test.sh` — an adversarial soak of the
+  *trusted* shell (path-traversal / symlink attacks, garbage-datagram floods, 40 MB transfers,
+  concurrency + eviction) that asserts the daemon never crashes and never writes outside its spool.
+  It surfaced and fixed three real robustness bugs: a `Natural(part_no)` overflow crash on hostile
+  packets, a blocking pool-acquire that could deadlock the capture loop, and idle-only eviction; the
+  capture loop now has a defence-in-depth handler so no single datagram can take it down
 - **Phase 5 — docs & proof hardening** ✅ codec core fully proved AoRTE (0 unproved, 0 justified);
   **`man/man1/{sender,receiver}_stream.1`** man pages; the standing assurance task is a written
   account of the trusted I/O boundary
