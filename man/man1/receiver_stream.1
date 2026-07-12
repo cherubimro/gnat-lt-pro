@@ -1,0 +1,206 @@
+.TH RECEIVER_STREAM 1 "2026-07-12" "gnat-lt-pro" "gnat-lt-pro Manual"
+.SH NAME
+receiver_stream \- one\-way LT fountain\-code receiver daemon
+.SH SYNOPSIS
+.B receiver_stream
+.RB [ \-\-pipe ]
+.RB [ \-\-progress ]
+.RB [ \-\-config
+.IR file ]
+.RB [ \-\-max\-inflight
+.IR n ]
+.RB [ \-\-evict\-timeout
+.IR s ]
+.br
+.RB [ \-\-syslog " | " \-\-log
+.IR file ]
+.RB [ \-\-log\-level
+.IR lvl ]
+.RB [ \fIport spool SEED loss%\fR ]
+.SH DESCRIPTION
+.B receiver_stream
+receives an LT fountain stream from
+.BR sender_stream (1)
+over UDP and reconstructs the original files.  A tight
+.B capture loop
+drains the socket in batches (\fBrecvmmsg\fR), routes each datagram to its
+transfer by
+.BR FILEID ,
+and accumulates it into a pre\-allocated per\-group decoder state \(em it never
+decodes on the capture path, so the socket buffer is not starved.  A separate
+.B decode task
+reconstructs each completed group, writes it out, and on the trailer applies the
+whole\-stream
+.B checksum gate.
+.PP
+Up to
+.I max_inflight
+transfers (distinct FILEIDs) decode
+.B concurrently,
+each finalizing independently; RAM is bounded by a fixed pool of group states.
+The
+.I SEED
+must match the sender's.
+.PP
+In
+.B file mode
+the process is a daemon: it loops indefinitely, and each transfer is written to
+.IR spool / name
+and gated \(em on a checksum match a
+.RI \fB name \fR.finished
+marker is written, otherwise
+.RI \fB name \fR.corrupt.
+In
+.B \-\-pipe
+mode it handles a single transfer, streams the decoded bytes to standard output,
+and exits with the verdict as its status.
+.SH OPTIONS
+.TP
+.B \-\-pipe
+Single\-shot: stream the decoded payload of the first transfer to standard output,
+then exit (exit status = verdict).
+.TP
+.B \-\-progress
+Print a throttled progress line to standard error.
+.TP
+.BI \-\-config " file"
+Read settings from
+.IR file
+(see
+.BR "CONFIGURATION FILE" ).
+If omitted,
+.I /etc/lt-diode/receiver.conf
+is read when it exists.
+.TP
+.BI \-\-max\-inflight " n"
+Maximum concurrent transfers (clamped to the compile\-time ceiling, 16).  The
+group\-state pool (~32\ MB per state, ~2n states) is allocated at start\-up, so a
+larger value uses more RAM.  Default 3.
+.TP
+.BI \-\-evict\-timeout " s"
+Seconds of inactivity after which a stalled transfer (lost trailer) is evicted as
+.RB \fB name \fR.corrupt.
+Default 10.
+.TP
+.B \-\-syslog
+Route log lines to
+.BR syslog (3)
+(facility
+.BR daemon ,
+ident
+.BR lt-diode-receiver ).
+.TP
+.BI \-\-log " file"
+Append log lines to
+.IR file .
+.TP
+.BI \-\-log\-level " lvl"
+Minimum level:
+.BR debug ", " info " (default), " warn ", " error .
+.SH OPERANDS
+.I port spool SEED loss%
+may be given positionally or via the config file (\fBport\fR, \fBspool\fR,
+\fBseed\fR, \fBloss\fR).  They are required as four positional arguments only when
+not supplied by the config.
+.I loss%
+is accepted for parity with the sender; the receiver decodes from whatever arrives.
+.SH CONFIGURATION FILE
+A
+.B "key = value"
+file (\fB#\fR comments, whitespace trimmed).  Precedence, low to high:
+built\-in defaults < config file < command\-line.  Recognised keys:
+.TP
+.BR port ", " spool ", " seed ", " loss
+Transport / spool settings (as the positional operands).
+.TP
+.B verify_log
+Path of the verdict journal (default
+.IR spool /verify.log ).
+.TP
+.BR max_inflight ", " evict_timeout
+As
+.BR \-\-max\-inflight " / " \-\-evict\-timeout .
+.TP
+.BR log_dest ", " log_file ", " log_level
+Log destination
+.RB ( stderr " | " file " | " syslog ),
+file path, and minimum level.
+.SH FILES
+.TP
+.IR spool / name
+Decoded output file (created with
+.BR O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW ;
+numbered
+.IR .1 ", " .2 ", \(em on a name collision)."
+.TP
+.IR spool / name \fB.finished\fR ", " spool / name \fB.corrupt\fR
+Per\-transfer verdict markers.
+.TP
+.IR spool /verify.log
+Append\-only journal; one line per finalized transfer:
+.RS
+.EX
+<timestamp> <path> bytes=N verdict=ok|corrupt reason=ok|decode|checksum|size|eviction
+.EE
+.RE
+.TP
+.I /etc/lt-diode/receiver.conf
+Default configuration file.
+.SH EXIT STATUS
+In file mode the daemon does not exit on its own.  In
+.B \-\-pipe
+mode it exits
+.B 0
+when the whole\-stream checksum matches, non\-zero otherwise.
+.SH SECURITY
+Output is created with
+.BR O_EXCL " (never overwrites; a pre\-planted symlink at the name is skipped)"
+and
+.BR O_NOFOLLOW " (a symlink is never followed)."
+The FILEID is reduced to a safe basename \(em only
+.BR "[A\-Za\-z0\-9._\-]" ,
+never
+.IR . ", " .. ,
+a leading dot, or a path separator \(em or the transfer is rejected.
+.SH NOTES
+For line\-rate reception raise the kernel socket\-buffer ceiling, e.g.
+.IR "sysctl \-w net.core.rmem_max=134217728" .
+The receiver already requests a large
+.B SO_RCVBUF
+and batches with
+.BR recvmmsg ;
+without a raised ceiling and on a link with no backpressure the sender may need
+.BR \-\-pace\-us .
+.SH EXAMPLES
+.PP
+File\-mode daemon:
+.PP
+.RS
+.EX
+receiver_stream 9000 /var/lib/lt-diode/incoming 42 30
+.EE
+.RE
+.PP
+From a config file, three concurrent transfers:
+.PP
+.RS
+.EX
+receiver_stream --config /etc/lt-diode/receiver.conf --max-inflight 3
+.EE
+.RE
+.PP
+Pipe a ZFS stream straight into
+.BR "zfs receive" :
+.PP
+.RS
+.EX
+receiver_stream --pipe 9000 /tmp/ltc 42 30 | zfs receive tank/ds
+.EE
+.RE
+.SH SEE ALSO
+.BR sender_stream (1)
+.SH AUTHOR
+Ada/SPARK port produced at Politehnica University Timisoara; based on
+lt-diode-pro (cherubimro), itself a fork of melorian94/robust-soliton-LT-C by Petra.
+.SH LICENSE
+GNU Affero General Public License v3.0.

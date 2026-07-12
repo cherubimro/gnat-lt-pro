@@ -1,0 +1,138 @@
+.TH SENDER_STREAM 1 "2026-07-12" "gnat-lt-pro" "gnat-lt-pro Manual"
+.SH NAME
+sender_stream \- one\-way LT fountain\-code sender (streaming, reads stdin)
+.SH SYNOPSIS
+.B sender_stream
+.RB [ \-\-progress ]
+.RB [ \-\-pace\-us
+.IR us ]
+.RB [ \-\-syslog " | " \-\-log
+.IR file ]
+.RB [ \-\-log\-level
+.IR lvl ]
+.I IP port SEED name loss%
+.SH DESCRIPTION
+.B sender_stream
+reads a payload from
+.B standard input
+and transmits it over UDP as a
+.B pure LT (Luby Transform) rateless erasure\-coded
+stream, for delivery across a strictly
+.B one\-way
+channel \(em a hardware data diode, or any lossy link with
+.B no feedback and no retransmission.
+It emits a continuous stream of XOR\-combined coding packets; the receiver
+reconstructs the file from
+.I any
+sufficiently large subset that arrives, so a lost packet is never re\-requested.
+.PP
+The input is coded
+.B group\-locally
+(~10\ MB per group), so it is read sequentially and never spooled or seeked \(em
+a pipe such as
+.B zfs send
+feeds straight in.  All packets go to a
+.B single UDP port
+(the packet's role is encoded in its header, so the C reference's three
+consecutive ports are not needed).  Every coding packet carries only its index;
+both ends derive the packet seed from
+.RI ( SEED ,
+group, index), so the receiver replays the same source\-symbol selection.
+.PP
+At end of input a
+.B trailer
+packet is sent five times carrying the exact byte count, the total group count
+and a whole\-stream XOR checksum, which the receiver uses as an integrity gate.
+The
+.I SEED
+and
+.I loss%
+values
+.B must be identical
+on the sender and receiver.
+.SH OPTIONS
+.TP
+.B \-\-progress
+Print a throttled (~1/s) progress line to standard error: groups and bytes sent
+and the average MB/s.  The stdin size is unknown, so there is no percentage or ETA.
+.TP
+.BI \-\-pace\-us " us"
+Sleep roughly
+.I us
+microseconds per packet (applied in batches).  A real diode is paced by network
+backpressure; use this on loopback or a receiver that cannot keep up.  Default 0
+(no pacing).
+.TP
+.B \-\-syslog
+Route operational log lines to
+.BR syslog (3)
+(facility
+.BR daemon ,
+ident
+.BR lt-diode-sender )
+instead of standard error.
+.TP
+.BI \-\-log " file"
+Append operational log lines (timestamp + level) to
+.IR file .
+.TP
+.BI \-\-log\-level " lvl"
+Minimum level to emit:
+.BR debug ", " info " (default), " warn ", " error .
+.SH OPERANDS
+.TP
+.I IP
+Destination IPv4 address of the receiver.
+.TP
+.I port
+Destination UDP port (must match the receiver's).
+.TP
+.I SEED
+Shared LT seed; must be identical on sender and receiver.
+.TP
+.I name
+Logical transfer id placed in every packet header.  It is
+.B not
+a file that is opened \(em only its basename (sanitized) names the receiver's
+output.
+.TP
+.I loss%
+Expected channel loss, 0..90.  More coding packets are sent at higher loss so the
+receiver still gets ~1.25x
+.I K
+packets per group (comfortably above the ~1.15x decode threshold of the tuned
+Robust Soliton distribution).
+.SH EXIT STATUS
+.B 0
+on success; non\-zero on a usage or socket setup error.
+.SH SECURITY
+The channel is one\-way by design: there is no return path, so a corrupt or
+under\-provisioned transfer cannot be repaired \(em choose
+.I loss%
+conservatively for the link.  The
+.I name
+operand never opens or reads a file.
+.SH EXAMPLES
+.PP
+Send a file (30% loss margin):
+.PP
+.RS
+.EX
+cat bigfile | sender_stream 10.0.0.3 9000 42 bigfile 30
+.EE
+.RE
+.PP
+Replicate a ZFS dataset with zero temp space on both ends:
+.PP
+.RS
+.EX
+zfs send tank/ds@snap | sender_stream 10.0.0.3 9000 42 repl 30
+.EE
+.RE
+.SH SEE ALSO
+.BR receiver_stream (1)
+.SH AUTHOR
+Ada/SPARK port produced at Politehnica University Timisoara; based on
+lt-diode-pro (cherubimro), itself a fork of melorian94/robust-soliton-LT-C by Petra.
+.SH LICENSE
+GNU Affero General Public License v3.0.

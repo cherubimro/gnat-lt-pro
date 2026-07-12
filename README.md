@@ -196,9 +196,11 @@ How the harder obligations were closed:
   (runtime **`--max-inflight`**), **`recvmmsg` batching**, `O_EXCL|O_NOFOLLOW` writes, checksum gate,
   runtime-tunable **`--evict-timeout`** eviction, `--pipe`, config file + `verify.log` journal +
   systemd unit, timestamped/levelled logging (stderr/file/syslog), byte-exact end-to-end
-- **Phase 4 — integration** — loopback, simulated loss, multi-file, ENOSPC; reuse the systemd/init units
-- **Phase 5 — proof hardening** ✅ codec core fully proved AoRTE (0 unproved, 0 justified); the
-  remaining assurance task is documenting the trusted I/O boundary once Phases 2–3 land
+- **Phase 4 — integration** — end-to-end tests wired into `tools/check.sh` (build + proof +
+  in-memory matrix + file/pipe/parallel receiver + loopback); larger-scale / ENOSPC stress still open
+- **Phase 5 — docs & proof hardening** ✅ codec core fully proved AoRTE (0 unproved, 0 justified);
+  **`man/man1/{sender,receiver}_stream.1`** man pages; the standing assurance task is a written
+  account of the trusted I/O boundary
 
 ## Attribution & license
 

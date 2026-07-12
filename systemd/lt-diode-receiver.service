@@ -17,6 +17,7 @@
 
 [Unit]
 Description=gnat-lt-pro one-way LT fountain-code receiver
+Documentation=man:receiver_stream(1)
 After=network-online.target
 Wants=network-online.target
 
