@@ -42,7 +42,9 @@ tractable, and it unlocked two simplifications the C code could not make:
 
 SPARK cannot prove sockets, tasking or heap, so the design is layered. Everything a packet touches on
 its way to being decoded is in the **proven** column; everything the OS touches is in the small,
-enumerable **trusted** column.
+enumerable **trusted** column. The full assurance case — what is proven, what is trusted, the
+proof's assumptions, and how the trusted shell is justified — is in
+[`docs/ASSURANCE.md`](docs/ASSURANCE.md).
 
 | Layer | Mode | Contents |
 |---|---|---|
@@ -204,9 +206,10 @@ How the harder obligations were closed:
   It surfaced and fixed three real robustness bugs: a `Natural(part_no)` overflow crash on hostile
   packets, a blocking pool-acquire that could deadlock the capture loop, and idle-only eviction; the
   capture loop now has a defence-in-depth handler so no single datagram can take it down
-- **Phase 5 — docs & proof hardening** ✅ codec core fully proved AoRTE (0 unproved, 0 justified);
-  **`man/man1/{sender,receiver}_stream.1`** man pages; the standing assurance task is a written
-  account of the trusted I/O boundary
+- **Phase 5 — docs & assurance** ✅ codec core fully proved AoRTE (0 unproved, 0 justified);
+  `man/man1/{sender,receiver}_stream.1` man pages; and the **written assurance argument**,
+  [`docs/ASSURANCE.md`](docs/ASSURANCE.md) — what is proven, what is trusted, where the boundary
+  sits and why, the proof's assumptions, and how the trusted shell is justified
 
 ## Attribution & license
 
