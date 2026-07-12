@@ -186,12 +186,32 @@ cost is on paper rather than discovered later.
   connection state), and the 1472-byte packet rides in a raw Ethernet payload
   (14 + 1472 = 1486 ≤ 1500 MTU) with no fragmentation.
 
+**A C shim would be mandatory, not a convenience.** DPDK's data-path API is not
+linkable from Ada: `rte_eth_rx_burst`, `rte_eth_tx_burst` and the `rte_pktmbuf_*`
+accessors are `static inline` in the headers (DPDK inlines the burst path
+deliberately — that is where its performance comes from), and `nm` confirms
+**zero exported symbols** for them, while the *setup* calls (`rte_eal_init`,
+`rte_eth_dev_configure`, `rte_eth_*_queue_setup`, `rte_eth_dev_start`) are real
+symbols that bind directly. So `Import, Convention => C` reaches the port
+bring-up but **cannot reach the packet loop**: there is no symbol to resolve.
+The DPDK backend therefore necessarily adds a small C translation unit (~60–80
+lines) exposing non-inline wrappers — `lt_dpdk_rx_burst` / `lt_dpdk_tx_burst` /
+`lt_dpdk_mtod` / `lt_dpdk_free` — which Ada imports exactly as it imports
+`recvmmsg` today. This is the same hand-bound-C technique already in the shell
+(§5), and the shim is small enough to review line by line; but it is **a new C
+file on the data path inside the TCB**, and the assurance ledger must say so
+rather than treat the binding as free. `gprbuild` compiles it (`for Languages use
+("Ada", "C")`); the DPDK flags come from `pkg-config libdpdk` — `--static --libs`
+is required, not cosmetic, since it emits `--whole-archive` and without it the
+PMD constructors never self-register and no port appears at run time.
+
 The reason DPDK is **not** the default, and must be a deliberate opt-in, is the
 trusted computing base:
 
 | | Kernel path | DPDK path |
 |---|---|---|
 | In-process unproven C on the data path | small reviewed bindings (§5 table) | **DPDK EAL + mempool + the NIC PMD** — a large third-party C body |
+| How Ada reaches the packet loop | direct `Import` of `recvmmsg` (a real symbol) | **an unavoidable C shim** — the burst/mbuf API is `static inline`, so nothing to link against |
 | Who bounds a hostile datagram first | the kernel network stack, then `Handle` | the PMD, then `Handle` |
 | Memory | kernel socket buffers | hugepages + mbuf pools; alloc/free discipline moves into the shell |
 | Threading | the Ada capture/decode tasks | a pinned DPDK lcore feeding the existing decode task |
