@@ -118,8 +118,22 @@ a wire.** It needs no root precisely *because* it bypasses nothing.
 
 ### Real kernel bypass (two physical machines) — the honest requirements
 
-> **Full step-by-step recipe: [`KERNEL-BYPASS.TXT`](KERNEL-BYPASS.TXT)** — IOMMU, hugepages, binding
-> a spare NIC, running non-root, and a troubleshooting section.
+The whole flow is one command per machine — it builds a NIC-capable DPDK, builds against it, verifies
+VFIO and the card's PMD actually landed in the binary, allocates hugepages, binds the NIC, and runs.
+It skips what is already done, so re-running is cheap:
+
+```sh
+./tools/bypass.sh doctor                                 # no root, changes nothing
+
+sudo ./tools/bypass.sh receiver eno2                     # machine A
+sudo ./tools/bypass.sh sender   eno2 /path/to/bigfile    # machine B
+sudo ./tools/bypass.sh teardown eno2                     # NIC back to the kernel
+```
+
+> **What it is doing, and what to do when it fails: [`KERNEL-BYPASS.TXT`](KERNEL-BYPASS.TXT)** —
+> IOMMU, hugepages, binding a spare NIC, running non-root, and a troubleshooting section.
+
+The requirements it enforces, stated plainly:
 
 | | Needs root? | Kernel bypassed? |
 |---|---|---|

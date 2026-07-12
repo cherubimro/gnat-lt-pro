@@ -12,6 +12,34 @@
 
 
 ===============================================================================
+ IN A HURRY?  THE WHOLE FLOW IS ONE COMMAND
+===============================================================================
+
+ On each machine, first look before you leap (no root, changes nothing):
+
+     ./tools/bypass.sh doctor
+
+ Then, on the two machines with the Intel cards:
+
+     sudo ./tools/bypass.sh receiver eno2                    # machine A
+     sudo ./tools/bypass.sh sender   eno2 /path/to/bigfile   # machine B
+
+ That single command builds a DPDK with the PCI bus and the Intel PMDs, builds
+ the sender/receiver against it, verifies VFIO and your card's PMD really landed
+ in the binary, allocates hugepages, binds the NIC to vfio-pci (refusing to
+ touch your SSH card), and runs.  It skips whatever is already done, so it is
+ safe to re-run.
+
+     sudo ./tools/bypass.sh teardown eno2      # give the NIC back to the kernel
+
+ THE SEED MUST MATCH ON BOTH MACHINES (default 1234; SEED=... to change it).
+
+ The rest of this document explains what that command is doing, and what to do
+ when it does not work.  Read section 0 at least -- it is the thing people get
+ wrong.
+
+
+===============================================================================
  0. FIRST: THREE THINGS THAT ARE NOT KERNEL BYPASS
 ===============================================================================
 
