@@ -133,11 +133,32 @@ so never bind the one carrying your SSH session. The *runtime* can then be non-r
 `/dev/vfio/<group>`, a writable hugepage mount, a raised `RLIMIT_MEMLOCK`); without an IOMMU,
 `noiommu` mode needs `CAP_SYS_RAWIO` — effectively root, and genuinely unsafe (unrestricted DMA).
 
-**Also: the vendored DPDK in `../dpdk/deps` cannot do it at all.** It was built with
-`-Denable_drivers=bus/vdev,...,net/memif` — no PCI NIC PMD, and our binary links **zero PCI/VFIO
-symbols**. For two physical machines you need a DPDK carrying your NIC's PMD (Debian/Ubuntu:
-`apt install libdpdk-dev`, which ships e1000/ixgbe/i40e/mlx5/…), then rebuild with
-`DPDK_PREFIX` unset so the system `libdpdk.pc` is used.
+**The vendored DPDK in `../dpdk/deps` cannot do it as shipped.** It was built with
+`-Denable_drivers=bus/vdev,...,net/memif` — no PCI NIC PMD at all, so a binary linked against it has
+**zero PCI/VFIO symbols** and you would get *"no ethdev port available"* after binding the card.
+Fix it with:
+
+```sh
+./tools/dpdk-build-nic.sh                       # rebuilds DPDK 22.11 with bus/pci + Intel PMDs
+DPDK_PREFIX="$PWD/../dpdk/deps/dpdk-install-nic" WITH_DPDK=yes ./tools/build.sh
+
+nm bin/receiver_stream | grep -ci vfio          # must be > 0
+nm bin/receiver_stream | grep -ci ixgbe         # must be > 0 for Intel 10G
+```
+
+It builds into a **separate prefix**, so the original vdev-only install stays intact, and it refuses
+to finish unless VFIO actually landed in the result. On Debian/Ubuntu none of this is needed — `apt
+install libdpdk-dev` ships every PMD; just leave `DPDK_PREFIX` unset.
+
+| Intel card | PMD |
+|---|---|
+| 82599, X520, X540, X550 | `ixgbe` — most Intel 10G |
+| X710, XL710, X722 | `i40e` |
+| E810 | `ice` |
+
+> This dev box's onboard NIC is a **Realtek RTL8168** — DPDK 22.11 has *no* Realtek PMD (it arrived
+> in 24.11, and RTL8168 support only in 25.07), so bypass is impossible on it regardless of
+> configuration. The Intel cards are the ones that work.
 
 ### Two physical machines, for real
 

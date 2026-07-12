@@ -100,24 +100,60 @@
           -Denable_drivers=bus/vdev,mempool/ring,net/af_packet,
                            net/tap,net/null,net/ring,net/memif
 
-      No PCI NIC driver is in there, and our binary links zero PCI/VFIO
-      symbols.  It is fine for the memif test and for af_packet.  It is
-      useless for vfio-pci.
+      No PCI NIC driver is in there.  Build this project against it and the
+      binary links ZERO PCI/VFIO symbols.  You would bind the card, start the
+      daemon, and get "no ethdev port available".  It is fine for the memif
+      test and for af_packet.  It is useless for vfio-pci.
 
-      Use the distribution DPDK instead, which ships the real drivers
-      (e1000, ixgbe, i40e, ice, mlx5, virtio, ...):
+      There are two ways out.
 
-          sudo apt install build-essential pkg-config libdpdk-dev dpdk   # Debian/Ubuntu
+      (a) ON THIS BOX (SUSE, no DPDK packages) -- rebuild DPDK with the NIC
+          drivers.  A script does it, into a SEPARATE prefix so the original
+          install stays intact:
 
-      Then build this project WITHOUT DPDK_PREFIX, so that pkg-config finds
-      the system libdpdk.pc rather than the vendored one:
+              ./tools/dpdk-build-nic.sh
 
-          unset DPDK_PREFIX
-          WITH_DPDK=yes ./tools/build.sh
+          It rebuilds the same vendored DPDK 22.11 source with bus/pci and the
+          Intel PMDs, into ../dpdk/deps/dpdk-install-nic, and refuses to finish
+          unless VFIO really ended up in it.  Then build us against it:
 
-      Confirm you got a real driver in (this must be > 0):
+              DPDK_PREFIX="$PWD/../dpdk/deps/dpdk-install-nic" \
+                  WITH_DPDK=yes ./tools/build.sh
 
-          nm bin/receiver_stream | grep -c rte_vfio_enable
+      (b) ON DEBIAN / UBUNTU -- do nothing special.  The distribution DPDK
+          already ships every PMD (e1000, ixgbe, i40e, ice, mlx5, virtio, ...):
+
+              sudo apt install build-essential pkg-config libdpdk-dev dpdk
+              unset DPDK_PREFIX          # so pkg-config finds the system libdpdk.pc
+              WITH_DPDK=yes ./tools/build.sh
+
+      EITHER WAY, VERIFY.  All of these must be non-zero before you go near
+      vfio-pci -- if they are zero, the driver is not in your binary and no
+      amount of binding will help:
+
+          nm bin/receiver_stream | grep -ci vfio      # VFIO support
+          nm bin/receiver_stream | grep -ci ixgbe     # Intel 82599/X520/X540/X550
+          nm bin/receiver_stream | grep -ci i40e      # Intel X710/XL710/X722
+
+      WHICH DRIVER FOR WHICH INTEL CARD:
+
+          ixgbe   82599, X520, X540, X550           <- most Intel 10G cards
+          i40e    X710, XL710, X722                 <- Intel 10/40G
+          ice     E810                              <- Intel 25/100G
+          e1000   82540..82576, igb                 <- Intel 1G
+
+      Find out which you have:
+
+          lspci -nn | grep -i ethernet
+          # or, without lspci:
+          cat /sys/bus/pci/devices/0000:XX:00.0/{vendor,device}
+          #   vendor 0x8086 = Intel
+
+      NOTE ON THIS DEVELOPMENT BOX: its onboard NIC is a Realtek RTL8168
+      (10ec:8168).  DPDK 22.11 has NO Realtek PMD at all -- Realtek support
+      (net/r8169) only arrived in DPDK 24.11, and RTL8168 specifically in
+      25.07.  So kernel bypass is impossible on this box's onboard port, no
+      matter what you configure.  You need the machines with the Intel cards.
 
 
 ===============================================================================

@@ -33,7 +33,20 @@ if [ "$WITH_DPDK" = "yes" ]; then
     DPDK_LIBS="$(pkg-config --static --libs libdpdk)"
     export DPDK_CFLAGS DPDK_LIBS
 
-    echo "build.sh: DPDK backend ON (libdpdk $(pkg-config --modversion libdpdk))"
+    echo "build.sh: DPDK backend ON (libdpdk $(pkg-config --modversion libdpdk), $DPDK_PREFIX)"
+fi
+
+#  gprbuild tracks Ada sources, NOT the value of an external.  Switching
+#  DPDK_PREFIX (say, from the memif-only vendored build to one carrying the NIC
+#  PMDs) changes only DPDK_LIBS -- so gprbuild sees nothing to do and happily
+#  keeps the old link, leaving you with a binary that silently lacks the very
+#  driver you just built.  Stamp the config and force a clean when it moves.
+STAMP="obj/.dpdk-config"
+WANT="$WITH_DPDK|${DPDK_PREFIX:-}|${DPDK_LIBS:-}"
+if [ "$(cat "$STAMP" 2>/dev/null || true)" != "$WANT" ]; then
+    [ -e "$STAMP" ] && echo "build.sh: DPDK config changed -> full rebuild"
+    gprclean -q -P lt_diode.gpr -XWITH_DPDK="$WITH_DPDK" 2>/dev/null || true
+    mkdir -p obj && printf '%s' "$WANT" > "$STAMP"
 fi
 
 gprbuild -P lt_diode.gpr -XWITH_DPDK="$WITH_DPDK" "$@"
