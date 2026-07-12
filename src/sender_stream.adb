@@ -5,6 +5,7 @@ with Ada.Text_IO;              use Ada.Text_IO;
 with Ada.Streams;
 with Ada.Unchecked_Conversion;
 with Ada.Calendar;             use Ada.Calendar;
+with Ada.Strings.Unbounded;    use Ada.Strings.Unbounded;
 with Interfaces;               use Interfaces;
 with System;
 with System.Storage_Elements;  use System.Storage_Elements;
@@ -15,6 +16,7 @@ with Lt_Rng;
 with Lt_Encoder;
 with Lt_Checksum;
 with Lt_Wire;
+with Lt_Log;
 
 --  Zero-temp streaming LT sender: reads the payload from stdin, emits an LT
 --  fountain stream over UDP, and never seeks or spools the input.  Coding is
@@ -48,6 +50,10 @@ procedure Sender_Stream is
    --  Parsed configuration.
    Progress : Boolean := False;
    Sock     : Socket_Type;
+
+   Log_Dest  : Lt_Log.Dest_Type  := Lt_Log.To_Stderr;
+   Log_File  : Unbounded_String  := Null_Unbounded_String;
+   Log_Level : Lt_Log.Level_Type := Lt_Log.Info;
 
    --  Optional pacing: sleep ~Pace_Us microseconds per packet, applied in
    --  batches so it respects the runtime's delay granularity.  A real diode is
@@ -173,15 +179,31 @@ begin
                Pace_Us := Natural'Value (Argument (Argi));
             end if;
          elsif F = "--syslog" then
-            null;                                   --  accepted; routed to stderr
-         elsif F = "--log" or else F = "--log-level" then
-            Argi := Argi + 1;                       --  accepted; value ignored
+            Log_Dest := Lt_Log.To_Syslog;
+         elsif F = "--log" then
+            Argi := Argi + 1;
+            if Argi <= Argument_Count then
+               Log_File := To_Unbounded_String (Argument (Argi));
+               Log_Dest := Lt_Log.To_File;
+            end if;
+         elsif F = "--log-level" then
+            Argi := Argi + 1;
+            if Argi <= Argument_Count then
+               declare
+                  Ignore : Boolean;
+               begin
+                  Ignore := Lt_Log.Parse_Level (Argument (Argi), Log_Level);
+               end;
+            end if;
          else
             exit;
          end if;
       end;
       Argi := Argi + 1;
    end loop;
+
+   Lt_Log.Init (Log_Dest, To_String (Log_File), "[sender]",
+                "lt-diode-sender", Log_Level);
 
    if Argument_Count - Argi + 1 /= 5 then
       Put_Line (Standard_Error,
@@ -243,8 +265,8 @@ begin
                              & A_IP & ":" & A_Port);
       end;
 
-      Put_Line (Standard_Error,
-        "[sender] " & A_Name & " -> " & A_IP & ":" & A_Port
+      Lt_Log.Log (Lt_Log.Info,
+        A_Name & " -> " & A_IP & ":" & A_Port
         & "  seed=" & A_Seed & "  loss=" & A_Loss & "%  coding/group="
         & N_Coding'Image);
 
@@ -286,8 +308,8 @@ begin
 
       Send_Trailer (Total_Bytes, Group_No, Cksum, A_Name);
 
-      Put_Line (Standard_Error,
-        "[sender] done:" & Group_No'Image & " groups,"
+      Lt_Log.Log (Lt_Log.Info,
+        "done:" & Group_No'Image & " groups,"
         & Unsigned_64'Image (Total_Bytes) & " bytes.");
       Close_Socket (Sock);
    end;

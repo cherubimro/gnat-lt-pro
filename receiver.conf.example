@@ -29,3 +29,10 @@ spool = /var/lib/lt-diode/incoming
 
 # Path of the per-transfer verdict journal.  Default: <spool>/verify.log
 # verify_log = /var/log/lt-diode/verify.log
+
+# --- Operational logging (timestamp + level) ---------------------------------
+# Where the [rs] operational lines go: stderr (default; journald timestamps it
+# under systemd) | file | syslog.  --syslog / --log <file> on the CLI override.
+# log_dest  = stderr
+# log_file  = /var/log/lt-diode/receiver.log      # when log_dest = file
+# log_level = info                                # debug | info | warn | error

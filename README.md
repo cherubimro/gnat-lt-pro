@@ -47,7 +47,7 @@ enumerable **trusted** column.
 | Layer | Mode | Contents |
 |---|---|---|
 | **`src/codec` — the codec core** | `SPARK_Mode => On` | RNG + coding-seed mix, robust-soliton PMF/CDF + sampler, index sampling, LT encoder, peeling decoder, XOR checksum, **wire (de)serialization** |
-| **`src` — the I/O shell** | `SPARK_Mode => Off` (trusted Ada) | `sender_stream` (UDP send, stdin framing, pacing); `receiver_stream` (UDP capture, decoupled decode task, hardened file output, checksum gate, `--pipe`) |
+| **`src` — the I/O shell** | `SPARK_Mode => Off` (trusted Ada) | `sender_stream` (UDP send, stdin framing, pacing); `receiver_stream` (`recvmmsg` capture, decoupled decode task, hardened file output, checksum gate, `--pipe`); `lt_conf` (config file), `lt_log` (timestamped/levelled logging) |
 
 The core is **allocation-free**: it operates on caller-supplied buffers with fixed-capacity working
 storage, so any heap lives only in the trusted shell and the bounds stay provable. It is also
@@ -192,9 +192,9 @@ How the harder obligations were closed:
 - **Phase 2 — `sender_stream`** ✅ proven wire format + stdin framing, single-port emit, UDP, pacing,
   CLI; verified byte-exact over loopback
 - **Phase 3 — `receiver_stream`** ✅ *done*: decoupled capture/decode, parallel per-FILEID transfers,
-  **`recvmmsg` batching**, `O_EXCL|O_NOFOLLOW` writes, checksum gate, eviction, `--pipe`, **config
-  file + `verify.log` journal + systemd unit**, byte-exact end-to-end. *Minor remaining:* timestamped
-  levelled logging (`--syslog`/`--log`), runtime `--max-inflight`/`--evict-timeout`
+  **`recvmmsg` batching**, `O_EXCL|O_NOFOLLOW` writes, checksum gate, eviction, `--pipe`, config file
+  + `verify.log` journal + systemd unit, **timestamped/levelled logging** (stderr/file/syslog),
+  byte-exact end-to-end. *Minor remaining:* runtime `--max-inflight`/`--evict-timeout`
 - **Phase 4 — integration** — loopback, simulated loss, multi-file, ENOSPC; reuse the systemd/init units
 - **Phase 5 — proof hardening** ✅ codec core fully proved AoRTE (0 unproved, 0 justified); the
   remaining assurance task is documenting the trusted I/O boundary once Phases 2–3 land

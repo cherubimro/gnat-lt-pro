@@ -21,6 +21,7 @@ with Lt_Checksum;
 with Lt_Wire;
 with Lt_Decoder_Std;
 with Lt_Conf;
+with Lt_Log;
 
 --  Streaming LT receiver daemon.  A tight capture loop routes each datagram to
 --  its transfer by FILEID and accumulates it into a pre-allocated group decoder
@@ -115,6 +116,12 @@ procedure Receiver_Stream is
    Progress  : Boolean := False;
    pragma Unreferenced (Progress);
    Seed      : U64 := 0;
+
+   --  Operational log routing (built-in default < config < CLI).
+   Log_Dest  : Lt_Log.Dest_Type  := Lt_Log.To_Stderr;
+   Log_File  : Unbounded_String  := Null_Unbounded_String;
+   Log_Level : Lt_Log.Level_Type := Lt_Log.Info;
+   Log_Cli   : Boolean := False;                  --  a --syslog/--log given
 
    Epoch : constant Ada.Real_Time.Time := Ada.Real_Time.Clock;
    function Now_Ms return U64 is
@@ -373,8 +380,8 @@ procedure Receiver_Stream is
                         elsif not Ok then "checksum"
                         else "ok");
                   begin
-                     Put_Line (Standard_Error,
-                       "[rs] transfer done (" & To_String (J.Path)
+                     Lt_Log.Log ((if Ok then Lt_Log.Info else Lt_Log.Warn),
+                       "transfer done (" & To_String (J.Path)
                        & "): bytes=" & J.Total_Bytes'Image
                        & (if Ok then "  VERIFIED" else "  CORRUPT reason="
                                                        & Reason));
@@ -391,8 +398,8 @@ procedure Receiver_Stream is
       end loop;
    exception
       when E : others =>
-         Put_Line (Standard_Error,
-           "[rs] decode task exception: " & Exception_Information (E));
+         Lt_Log.Log (Lt_Log.Error,
+           "decode task exception: " & Exception_Information (E));
          Sched.Finish_Pipe (1);
    end Decode_Task;
 
@@ -506,8 +513,7 @@ procedure Receiver_Stream is
    begin
       for S in 1 .. Max_Inflight loop
          if C_Have (S) and then Now - C_Last_Ms (S) > Evict_Ms then
-            Put_Line (Standard_Error, "[rs] evicting stalled transfer slot"
-                      & S'Image);
+            Lt_Log.Log (Lt_Log.Warn, "evicting stalled transfer slot" & S'Image);
             Post_Group (S, Last => True, Corrupt => True,
                         Total => 0, Cksum => Lt_Types.Zero_Symbol);
             Slots.Set_Draining (S);
@@ -555,7 +561,7 @@ procedure Receiver_Stream is
             Path : Unbounded_String;
          begin
             if Name = "" then
-               Put_Line (Standard_Error, "[rs] rejected unsafe FILEID");
+               Lt_Log.Log (Lt_Log.Warn, "rejected unsafe FILEID");
                Slots.Free_Slot (Slot);
                return;
             end if;
@@ -565,13 +571,11 @@ procedure Receiver_Stream is
             else
                Open_Output (To_String (A_Spool), Name, FD, Path);
                if FD = GNAT.OS_Lib.Invalid_FD then
-                  Put_Line (Standard_Error,
-                    "[rs] cannot create output for " & Name);
+                  Lt_Log.Log (Lt_Log.Error, "cannot create output for " & Name);
                   Slots.Free_Slot (Slot);
                   return;
                end if;
-               Put_Line (Standard_Error,
-                 "[rs] new transfer -> " & To_String (Path));
+               Lt_Log.Log (Lt_Log.Info, "new transfer -> " & To_String (Path));
             end if;
             C_FD (Slot) := FD;
             C_Path (Slot) := Path;
@@ -635,6 +639,23 @@ begin
             if Argi <= Argument_Count then
                Config_Path := To_Unbounded_String (Argument (Argi));
             end if;
+         elsif Argument (Argi) = "--syslog" then
+            Log_Dest := Lt_Log.To_Syslog; Log_Cli := True;
+         elsif Argument (Argi) = "--log" then
+            Argi := Argi + 1;
+            if Argi <= Argument_Count then
+               Log_File := To_Unbounded_String (Argument (Argi));
+               Log_Dest := Lt_Log.To_File; Log_Cli := True;
+            end if;
+         elsif Argument (Argi) = "--log-level" then
+            Argi := Argi + 1;
+            if Argi <= Argument_Count then
+               declare
+                  Ignore : Boolean;
+               begin
+                  Ignore := Lt_Log.Parse_Level (Argument (Argi), Log_Level);
+               end;
+            end if;
          end if;
          Argi := Argi + 1;
       end loop;
@@ -652,6 +673,31 @@ begin
             (if Config_Path /= Null_Unbounded_String then To_String (Config_Path)
              else "/etc/lt-diode/receiver.conf"),
             Loaded);
+
+         --  Log routing: config fills in what the CLI did not, then initialise.
+         if not Log_Cli then
+            declare
+               D : constant String := Lt_Conf.Get (Conf, "log_dest", "stderr");
+            begin
+               if    D = "syslog" then Log_Dest := Lt_Log.To_Syslog;
+               elsif D = "file"   then Log_Dest := Lt_Log.To_File;
+               else                    Log_Dest := Lt_Log.To_Stderr;
+               end if;
+            end;
+            if Lt_Conf.Has (Conf, "log_file") then
+               Log_File := To_Unbounded_String (Lt_Conf.Get (Conf, "log_file"));
+            end if;
+         end if;
+         if Lt_Conf.Has (Conf, "log_level") then
+            declare
+               Ignore : Boolean;
+            begin
+               Ignore := Lt_Log.Parse_Level
+                 (Lt_Conf.Get (Conf, "log_level"), Log_Level);
+            end;
+         end if;
+         Lt_Log.Init (Log_Dest, To_String (Log_File), "[rs]",
+                      "lt-diode-receiver", Log_Level);
 
          if Nargs /= 0 and then Nargs /= 4 then
             Put_Line (Standard_Error,
@@ -694,8 +740,8 @@ begin
                end;
             end if;
 
-            Put_Line (Standard_Error,
-              "[rs] listening on port " & Port_S
+            Lt_Log.Log (Lt_Log.Info,
+              "listening on port " & Port_S
               & (if Pipe_Mode then "  (pipe mode)" else "  spool " & Spool_S)
               & "  max_inflight=" & Max_Inflight'Image
               & "  batch=" & Batch'Image
