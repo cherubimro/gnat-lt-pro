@@ -9,13 +9,16 @@ the **Robust Soliton Distribution**; the receiver reconstructs the file from *an
 subset that arrives. This repository is a clean-slate rewrite of both ends in Ada, with the codec
 core written in the **SPARK** subset and proved free of run-time errors by `gnatprove`.
 
-> Status: **Phases 0–3 complete** — the proven codec core, the proven wire format, a working
-> **`sender_stream`**, and a working **`receiver_stream`** daemon: decoupled receive/decode, checksum
-> gate, file and `--pipe` modes, **parallel multi-transfer** (routed by FILEID, each finalizing
-> independently), and lost-trailer eviction. Sender → receiver reconstructs the stream
-> **byte-for-byte** over UDP, with `recvmmsg` batching on the capture path. Remaining receiver parity
-> (config file, `verify.log`) and Phases 4–5 are in the [Roadmap](#roadmap). Not yet a drop-in C
-> replacement.
+> Status: **Phases 0–5 complete.** The codec core is proved AoRTE — **175 checks, 0 unproved, 0
+> justified** — and both binaries are feature-complete: `sender_stream`, and a `receiver_stream`
+> daemon with decoupled receive/decode, the checksum gate, file and `--pipe` modes, **parallel
+> multi-transfer** (routed by FILEID, each finalizing independently), lost-trailer eviction, config
+> file, `verify.log`, syslog, and man pages. Sender → receiver reconstructs **byte-for-byte** at
+> 0–30 % loss, with `recvmmsg` batching on the capture path, and the trusted shell is
+> [adversarially stress-tested](tools/stress-test.sh). An **optional DPDK kernel-bypass transport**
+> is available behind `WITH_DPDK` — off by default, because it enlarges the TCB
+> ([`docs/ASSURANCE.md` §5.1](docs/ASSURANCE.md)). This is a clean-slate rewrite, not a drop-in
+> replacement for the C binaries.
 
 ## Why Ada/SPARK, and why a clean-slate rewrite
 
@@ -103,24 +106,26 @@ On the DPDK path the LT packet rides **raw in an Ethernet frame** (EtherType `0x
 `recvmmsg` and `rte_eth_tx_burst` replaces `Send_Socket`; `Handle`, `Lt_Wire.Parse`, the decoder and
 the checksum gate are byte-for-byte the same code.
 
+> **The trade, stated plainly.** DPDK moves its EAL, mempool and NIC PMD — a large third-party C
+> body — onto the data path *inside the TCB*, together with a small mandatory C shim (DPDK's burst
+> API is `static inline`, so there is no symbol for Ada to link against). Safety is unaffected: the
+> core is still proved, and the checksum gate still turns any mis-decode into a detected `.corrupt`.
+> What grows is what you must **trust**. The kernel path stays the assurance-maximal default.
+> Full ledger: [`docs/ASSURANCE.md` §5.1](docs/ASSURANCE.md).
+
+### Running it
+
 ```sh
-WITH_DPDK=yes ./tools/build.sh     # needs libdpdk via pkg-config (DPDK_PREFIX=... or libdpdk-dev)
-./tools/dpdk-test.sh               # exercises the DPDK code path — no root, no hugepages, no NIC
+./tools/dpdk-test.sh          # exercises the DPDK code path — no root, no hugepages, no NIC
 ```
 
-### What that test proves, and what it does not
+That test runs over **memif**, a shared-memory pipe between two processes on one machine. It
+genuinely drives EAL bring-up, the C shim and the burst API, and shows byte-exact decode with the
+checksum gate intact — but **memif is not kernel bypass and does not cross a wire**. It needs no root
+precisely *because* it bypasses nothing.
 
-`dpdk-test.sh` joins the two ends with the **memif** PMD — a *shared-memory pipe between two
-processes on one machine*. It is a real ethdev port, so it genuinely exercises EAL bring-up, the C
-shim, `rte_eth_rx_burst`/`rte_eth_tx_burst` and the raw-Ethernet framing, and it shows transfers
-decode byte-exact with the checksum gate intact. **But memif is not kernel bypass and does not cross
-a wire.** It needs no root precisely *because* it bypasses nothing.
-
-### Real kernel bypass (two physical machines) — the honest requirements
-
-The whole flow is one command per machine — it builds a NIC-capable DPDK, builds against it, verifies
-VFIO and the card's PMD actually landed in the binary, allocates hugepages, binds the NIC, and runs.
-It skips what is already done, so re-running is cheap:
+For **real kernel bypass between two physical machines** (`vfio-pci`, a spare Intel NIC, an IOMMU,
+hugepages, root to set up), the whole flow is one command per machine:
 
 ```sh
 ./tools/bypass.sh doctor                                 # no root, changes nothing
@@ -130,109 +135,11 @@ sudo ./tools/bypass.sh sender   eno2 /path/to/bigfile    # machine B
 sudo ./tools/bypass.sh teardown eno2                     # NIC back to the kernel
 ```
 
-> **What it is doing, and what to do when it fails: [`KERNEL-BYPASS.TXT`](KERNEL-BYPASS.TXT)** —
-> IOMMU, hugepages, binding a spare NIC, running non-root, and a troubleshooting section.
+> **Everything about kernel bypass — prerequisites, what is *not* bypass, the setup steps, running
+> non-root, and troubleshooting — is in [`KERNEL-BYPASS.TXT`](KERNEL-BYPASS.TXT).** Read it before
+> binding anything: a NIC bound to `vfio-pci` vanishes from the kernel, and pointing this at your SSH
+> card loses you the machine. (`tools/vfio-setup.sh` refuses to, but read it anyway.)
 
-The requirements it enforces, stated plainly:
-
-| | Needs root? | Kernel bypassed? |
-|---|---|---|
-| `memif` (the test above) | no | **no** — shared memory, one machine |
-| `af_packet` (`--vdev=net_af_packet0,iface=eth0`) | no, with `setcap cap_net_raw,cap_net_admin+ep` | **no** — frames still traverse the kernel |
-| `vfio-pci` (true bypass) | **yes, for setup** | **yes** |
-
-True bypass needs, once, as root: an IOMMU (`intel_iommu=on`, BIOS + reboot), hugepages, and a
-**spare** NIC bound to `vfio-pci` — a bound NIC *disappears from the kernel*, so never bind the one
-carrying your SSH session. `tools/vfio-setup.sh` does this and **refuses** to bind your default-route
-or SSH card, refuses a card DPDK has no PMD for, and checks the IOMMU group is viable first:
-
-```sh
-./tools/vfio-setup.sh status              # no root; shows PMD per card, marks DO NOT BIND
-./tools/vfio-setup.sh check               # IOMMU / vfio / hugepages preflight
-sudo ./tools/vfio-setup.sh hugepages 512
-sudo ./tools/vfio-setup.sh bind   eno2    # the spare Intel card
-sudo ./tools/vfio-setup.sh unbind eno2    # give it back to the kernel
-```
-
-The *runtime* can then be non-root (`bind` chowns `/dev/vfio/<group>` to the invoking user); without
-an IOMMU, `noiommu` mode needs `CAP_SYS_RAWIO` — effectively root, and genuinely unsafe
-(unrestricted DMA).
-
-**The vendored DPDK in `../dpdk/deps` cannot do it as shipped.** It was built with
-`-Denable_drivers=bus/vdev,...,net/memif` — no PCI NIC PMD at all, so a binary linked against it has
-**zero PCI/VFIO symbols** and you would get *"no ethdev port available"* after binding the card.
-Fix it with:
-
-```sh
-./tools/dpdk-build-nic.sh                       # rebuilds DPDK 22.11 with bus/pci + Intel PMDs
-DPDK_PREFIX="$PWD/../dpdk/deps/dpdk-install-nic" WITH_DPDK=yes ./tools/build.sh
-
-nm bin/receiver_stream | grep -ci vfio          # must be > 0
-nm bin/receiver_stream | grep -ci ixgbe         # must be > 0 for Intel 10G
-```
-
-It builds into a **separate prefix**, so the original vdev-only install stays intact, and it refuses
-to finish unless VFIO actually landed in the result. On Debian/Ubuntu none of this is needed — `apt
-install libdpdk-dev` ships every PMD; just leave `DPDK_PREFIX` unset.
-
-| Intel card | PMD |
-|---|---|
-| 82599, X520, X540, X550 | `ixgbe` — most Intel 10G |
-| X710, XL710, X722 | `i40e` |
-| E810 | `ice` |
-
-> This dev box's onboard NIC is a **Realtek RTL8168** — DPDK 22.11 has *no* Realtek PMD (it arrived
-> in 24.11, and RTL8168 support only in 25.07), so bypass is impossible on it regardless of
-> configuration. The Intel cards are the ones that work.
-
-### Two physical machines, for real
-
-Both ends must share an L2 segment (same switch/VLAN, or a direct cable). Prefer wired: Wi-Fi and
-cloud virtual networks usually drop unknown-EtherType frames — and `0x88B6` is exactly that.
-
-**(a) `af_packet` — works today, no root at run time, but *not* bypass.** The NIC keeps its kernel
-driver, so SSH keeps working and nothing needs rebinding:
-
-```sh
-sudo setcap cap_net_raw,cap_net_admin+ep ./bin/receiver_stream ./bin/sender_stream   # once
-
-# receiver                                    # sender
-./bin/receiver_stream --with-dpdk \           ./bin/sender_stream --with-dpdk \
-  --eal "--no-huge --vdev=net_af_packet0,iface=eno1" \
-                                                --eal "--no-huge --vdev=net_af_packet0,iface=enp2s0" \
-  0 /var/spool/lt 1234 0                        0 0 1234 myfile 0 < myfile
-```
-
-Watch the frames from a third box: `sudo tcpdump -i eno1 ether proto 0x88b6`.
-
-**(b) `vfio-pci` — real kernel bypass.** Needs a **spare** NIC, an IOMMU and root for setup:
-
-```sh
-# once, as root, on each machine — NEVER the NIC carrying your SSH session
-echo 512 | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
-sudo modprobe vfio-pci
-sudo dpdk-devbind.py --status-dev net              # find the spare NIC's PCI address
-sudo ip link set eno2 down
-sudo dpdk-devbind.py -b vfio-pci 0000:03:00.0      # it now vanishes from the kernel
-
-# then (no --vdev: the PCI port is probed; no --no-huge: use the hugepages)
-sudo ./bin/receiver_stream --with-dpdk --eal "-l 0" 0 /var/spool/lt 1234 0
-sudo ./bin/sender_stream   --with-dpdk --eal "-l 1" 0 0 1234 myfile 0 < myfile
-
-sudo dpdk-devbind.py -b e1000e 0000:03:00.0        # hand it back to the kernel
-```
-
-The `sudo` on the run lines can be dropped after chowning `/dev/vfio/<group>` to the user, making
-the hugepage mount writable, and raising `RLIMIT_MEMLOCK` — but the **setup** above is root, and
-without an IOMMU the `noiommu` fallback needs `CAP_SYS_RAWIO` (effectively root, and unsafe:
-unrestricted DMA). That privilege envelope is part of the DPDK trade, not separate from it.
-
-> **The trade, stated plainly.** DPDK moves its EAL, mempool and NIC PMD — a large third-party C
-> body — onto the data path *inside the TCB*, together with a small mandatory C shim (DPDK's burst
-> API is `static inline`, so there is no symbol for Ada to link against). Safety is unaffected: the
-> core is still proved, and the checksum gate still turns any mis-decode into a detected `.corrupt`.
-> What grows is what you must **trust**. The kernel path stays the assurance-maximal default.
-> The full ledger is [`docs/ASSURANCE.md` §5.1](docs/ASSURANCE.md).
 
 ### Sender
 

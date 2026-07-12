@@ -184,6 +184,36 @@
       matter what you configure.  You need the machines with the Intel cards.
 
 
+ 1.5  GETTING THE CODE ONTO THE TWO MACHINES.
+
+      Option A -- COPY THE BINARIES.  No toolchain needed on the Intel machines.
+      DPDK links STATICALLY into our binaries, so a machine of the same distro
+      and architecture needs neither GNAT nor DPDK:
+
+          # once, on the build box:
+          ./tools/dpdk-build-nic.sh
+          DPDK_PREFIX="$PWD/../dpdk/deps/dpdk-install-nic" \
+              WITH_DPDK=yes ./tools/build.sh
+
+          # then to each Intel machine:
+          rsync -a bin/ tools/ intel-a:lt-diode/
+          rsync -a bin/ tools/ intel-b:lt-diode/
+
+      tools/pmd-ids.txt travels with them.  That file is why the scripts can
+      still say "this card needs ixgbe" on a machine with no DPDK source tree --
+      it is generated from DPDK's own PCI id tables by tools/gen-pmd-ids.sh.
+      Without it they would report PMD '?' and refuse to bind a perfectly good
+      card.
+
+      Option B -- BUILD ON EACH MACHINE.  Needs GNAT 14.2 + gprbuild.  On
+      Debian/Ubuntu the distro DPDK already carries every PMD, so there is
+      nothing to build by hand:
+
+          sudo apt install build-essential pkg-config libdpdk-dev dpdk
+          unset DPDK_PREFIX        # so pkg-config finds the system libdpdk.pc
+          WITH_DPDK=yes ./tools/build.sh
+
+
 ===============================================================================
  2. SET IT UP  (as root, once per machine, survives until reboot)
 ===============================================================================
