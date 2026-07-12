@@ -22,6 +22,7 @@ with Lt_Wire;
 with Lt_Decoder_Std;
 with Lt_Conf;
 with Lt_Log;
+with Lt_Dpdk;
 
 --  Streaming LT receiver daemon.  A tight capture loop routes each datagram to
 --  its transfer by FILEID and accumulates it into a pre-allocated group decoder
@@ -139,6 +140,12 @@ procedure Receiver_Stream is
    --  CLI overrides for the runtime tunables (-1 = not given on the CLI).
    MI_Cli : Integer := -1;                         --  --max-inflight
    ET_Cli : Integer := -1;                         --  --evict-timeout (seconds)
+
+   --  Transport selection (docs/ASSURANCE.md §5.1).  Default: the kernel path.
+   --  --with-dpdk swaps the *capture* mechanism only -- Handle, Lt_Wire.Parse,
+   --  the decoder and the checksum gate below are byte-for-byte the same.
+   Use_Dpdk : Boolean := False;
+   Eal_Args : Unbounded_String := Null_Unbounded_String;
 
    Epoch : constant Ada.Real_Time.Time := Ada.Real_Time.Clock;
    function Now_Ms return U64 is
@@ -525,6 +532,9 @@ procedure Receiver_Stream is
 
    --  recvmmsg receive batch: Batch packet buffers, each wired to a message.
    FD_C : Interfaces.C.int;
+   --  DPDK capture buffers (unused, and untouched, on the kernel path).
+   D_Bufs : Lt_Dpdk.Packet_Array;
+
    type Buf_Pool is array (1 .. Batch) of aliased Lt_Wire.Packet_Buffer;
    type Iov_Pool is array (1 .. Batch) of aliased Iovec;
    type Msg_Pool is array (1 .. Batch) of aliased Mmsghdr;
@@ -715,6 +725,13 @@ begin
                begin ET_Cli := Integer'Value (Argument (Argi));
                exception when others => null; end;
             end if;
+         elsif Argument (Argi) = "--with-dpdk" then
+            Use_Dpdk := True;
+         elsif Argument (Argi) = "--eal" then
+            Argi := Argi + 1;
+            if Argi <= Argument_Count then
+               Eal_Args := To_Unbounded_String (Argument (Argi));
+            end if;
          end if;
          Argi := Argi + 1;
       end loop;
@@ -800,7 +817,7 @@ begin
             Spool_S : constant String := Val (1, "spool", ".");
             Seed_S  : constant String := Val (2, "seed", "0");
          begin
-            if Port_S = "" then
+            if Port_S = "" and then not Use_Dpdk then
                Put_Line (Standard_Error,
                  "[rs] no port given (CLI arg or config 'port' required)");
                GNAT.OS_Lib.OS_Exit (2);
@@ -808,13 +825,39 @@ begin
             A_Spool := To_Unbounded_String (Spool_S);
             Seed := U64'Value (Seed_S);
 
-            Create_Socket (Sock, Family_Inet, Socket_Datagram);
-            Set_Socket_Option (Sock, Socket_Level, (Reuse_Address, True));
-            Set_Socket_Option (Sock, Socket_Level, (Receive_Buffer, 67_108_864));
-            Bind_Socket (Sock, (Family => Family_Inet, Addr => Any_Inet_Addr,
-                                Port => Port_Type (Natural'Value (Port_S))));
-            Set_Socket_Option
-              (Sock, Socket_Level, (Receive_Timeout, Timeout => 2.0));
+            if Use_Dpdk then
+               --  Kernel-bypass capture: bring up the EAL and an ethdev port
+               --  instead of binding a UDP socket.  There is no port number on
+               --  this path -- frames are raw Ethernet (EtherType 0x88B6).
+               if not Lt_Dpdk.Available then
+                  Put_Line (Standard_Error,
+                    "[rs] FATAL: --with-dpdk given, but this binary was built"
+                    & " without DPDK support.");
+                  Put_Line (Standard_Error,
+                    "[rs]        rebuild with:  WITH_DPDK=yes ./tools/build.sh");
+                  GNAT.OS_Lib.OS_Exit (2);
+               end if;
+               declare
+                  Ok : Boolean;
+               begin
+                  Lt_Dpdk.Init (To_String (Eal_Args), Ok);
+                  if not Ok then
+                     Put_Line (Standard_Error,
+                       "[rs] FATAL: DPDK init failed (EAL args: "
+                       & """" & To_String (Eal_Args) & """)");
+                     GNAT.OS_Lib.OS_Exit (2);
+                  end if;
+               end;
+            else
+               Create_Socket (Sock, Family_Inet, Socket_Datagram);
+               Set_Socket_Option (Sock, Socket_Level, (Reuse_Address, True));
+               Set_Socket_Option
+                 (Sock, Socket_Level, (Receive_Buffer, 67_108_864));
+               Bind_Socket (Sock, (Family => Family_Inet, Addr => Any_Inet_Addr,
+                                   Port => Port_Type (Natural'Value (Port_S))));
+               Set_Socket_Option
+                 (Sock, Socket_Level, (Receive_Timeout, Timeout => 2.0));
+            end if;
 
             if not Pipe_Mode then                --  open verify.log (append)
                declare
@@ -830,7 +873,9 @@ begin
             end if;
 
             Lt_Log.Log (Lt_Log.Info,
-              "listening on port " & Port_S
+              (if Use_Dpdk
+               then "listening on DPDK port 0 (kernel bypass, EtherType 0x88B6)"
+               else "listening on port " & Port_S)
               & (if Pipe_Mode then "  (pipe mode)" else "  spool " & Spool_S)
               & "  max_inflight=" & Max_Inflight'Image
               & "  evict_timeout=" & U64'Image (Evict_Ms / 1000) & "s"
@@ -841,18 +886,22 @@ begin
    end;
 
    --  Wire each message in the batch to its own packet buffer (once).
-   for I in 1 .. Batch loop
-      Iovs (I) := (Base => Bufs (I)'Address, Len => Lt_Wire.Max_Buf_Len);
-      Msgs (I) := (Hdr => (Name       => System.Null_Address,
-                           Namelen    => 0,
-                           Iov        => Iovs (I)'Address,
-                           Iovlen     => 1,
-                           Control    => System.Null_Address,
-                           Controllen => 0,
-                           Flags      => 0),
-                   Len => 0);
-   end loop;
-   FD_C := Interfaces.C.int (GNAT.Sockets.To_C (Sock));
+   --  Kernel path only: on the DPDK path the shim owns the mbufs and copies
+   --  whole packets straight into D_Bufs, so there is no iovec to wire.
+   if not Use_Dpdk then
+      for I in 1 .. Batch loop
+         Iovs (I) := (Base => Bufs (I)'Address, Len => Lt_Wire.Max_Buf_Len);
+         Msgs (I) := (Hdr => (Name       => System.Null_Address,
+                              Namelen    => 0,
+                              Iov        => Iovs (I)'Address,
+                              Iovlen     => 1,
+                              Control    => System.Null_Address,
+                              Controllen => 0,
+                              Flags      => 0),
+                      Len => 0);
+      end loop;
+      FD_C := Interfaces.C.int (GNAT.Sockets.To_C (Sock));
+   end if;
 
    declare
       Last_Sweep : U64 := 0;
@@ -860,14 +909,9 @@ begin
       Capture :
       loop
          declare
-            --  Drain up to Batch datagrams in one syscall (MSG_WAITFORONE:
-            --  return as soon as one is in hand).  SO_RCVTIMEO bounds the idle
-            --  wait.
-            R    : constant Interfaces.C.int :=
-              C_Recvmmsg (FD_C, Msgs'Address, Interfaces.C.unsigned (Batch),
-                          MSG_WAITFORONE, System.Null_Address);
             Now  : constant U64 := Now_Ms;
             Stop : Boolean;
+            Cnt  : Natural := 0;
          begin
             --  Reap stalled transfers at least once a second, whether or not
             --  traffic is flowing (idle-only eviction would let a burst of
@@ -877,24 +921,60 @@ begin
                Last_Sweep := Now;
             end if;
 
-            if R <= 0 then
-               null;                               --  timeout / EINTR: loop
-            else
-               for I in 1 .. Natural (R) loop
-                  if Msgs (I).Len = Lt_Wire.Max_Buf_Len then
-                     --  Defence in depth: no single (possibly hostile) datagram
-                     --  may ever take down the capture loop.
-                     begin
-                        Handle (Bufs (I), Stop);
-                        exit Capture when Stop;
-                     exception
-                        when E : others =>
-                           Lt_Log.Log (Lt_Log.Error,
-                             "dropped packet on exception: "
-                             & Exception_Message (E));
-                     end;
-                  end if;
+            if Use_Dpdk then
+               --  Kernel bypass: poll the port.  The shim has already dropped
+               --  every frame that is not a full-length LT frame, so buffers
+               --  1 .. Cnt are exactly the candidates -- the same contract the
+               --  kernel path gets from its `Len = Max_Buf_Len` test below.
+               Lt_Dpdk.Rx_Burst (D_Bufs, Cnt);
+
+               for I in 1 .. Cnt loop
+                  --  Defence in depth: no single (possibly hostile) frame may
+                  --  ever take down the capture loop.
+                  begin
+                     Handle (D_Bufs (I), Stop);
+                     exit Capture when Stop;
+                  exception
+                     when E : others =>
+                        Lt_Log.Log (Lt_Log.Error,
+                          "dropped packet on exception: "
+                          & Exception_Message (E));
+                  end;
                end loop;
+
+               --  A pure DPDK app busy-polls a dedicated core.  We sleep only
+               --  when the burst came back empty: a live transfer never pays
+               --  for it, and an idle daemon does not peg a CPU.
+               if Cnt = 0 then
+                  delay 0.001;
+               end if;
+
+            else
+               declare
+                  --  Drain up to Batch datagrams in one syscall
+                  --  (MSG_WAITFORONE: return as soon as one is in hand).
+                  --  SO_RCVTIMEO bounds the idle wait.
+                  R : constant Interfaces.C.int :=
+                    C_Recvmmsg (FD_C, Msgs'Address,
+                                Interfaces.C.unsigned (Batch),
+                                MSG_WAITFORONE, System.Null_Address);
+               begin
+                  if R > 0 then                    --  R <= 0: timeout / EINTR
+                     for I in 1 .. Natural (R) loop
+                        if Msgs (I).Len = Lt_Wire.Max_Buf_Len then
+                           begin
+                              Handle (Bufs (I), Stop);
+                              exit Capture when Stop;
+                           exception
+                              when E : others =>
+                                 Lt_Log.Log (Lt_Log.Error,
+                                   "dropped packet on exception: "
+                                   & Exception_Message (E));
+                           end;
+                        end if;
+                     end loop;
+                  end if;
+               end;
             end if;
          end;
       end loop Capture;

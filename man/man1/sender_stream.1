@@ -79,6 +79,40 @@ Append operational log lines (timestamp + level) to
 .BI \-\-log\-level " lvl"
 Minimum level to emit:
 .BR debug ", " info " (default), " warn ", " error .
+.TP
+.B \-\-with\-dpdk
+Transmit with DPDK poll\-mode kernel bypass instead of a UDP socket.  Packets go
+out as raw Ethernet frames (EtherType
+.BR 0x88B6 ),
+so the
+.I IP
+and
+.I port
+operands are ignored on this path (pass any placeholder).  Requires a binary
+built with
+.BR "WITH_DPDK=yes ./tools/build.sh" ;
+otherwise this exits 1 with a diagnostic.
+.TP
+.BI \-\-eal " args"
+EAL command line passed verbatim to DPDK, as one quoted argument, e.g.
+.RB \(dq "\-\-no\-huge \-l 1 \-\-vdev=net_memif0,role=client,socket=/tmp/s.sock,socket\-abstract=no" \(dq.
+Only meaningful with
+.BR \-\-with\-dpdk .
+.TP
+.BI \-\-dst " MAC"
+Destination MAC on the DPDK path,
+.IR aa:bb:cc:dd:ee:ff .
+Default is broadcast, which is what a diode wants: the sender need not know the
+receiver.
+.SH TRANSPORTS
+The encoder, the sampler and the wire format are identical on both paths; only
+how a serialized packet leaves the process changes.  The DPDK path moves DPDK's
+EAL, mempool and NIC PMD, plus a small mandatory C shim, into the trusted
+computing base.  The kernel path remains the assurance\-maximal default.  See
+.BR receiver_stream (1)
+and
+.I docs/ASSURANCE.md
+\(sc5.1 for the full trade.
 .SH OPERANDS
 .TP
 .I IP

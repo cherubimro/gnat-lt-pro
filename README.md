@@ -83,6 +83,111 @@ Toolchain: **GNAT 14.2.0 + gprbuild 24 + gnatprove** (SPARK). `tools/env.sh` put
 ./tools/stress-test.sh     # adversarial soak of the trusted shell (attacks + floods + scale)
 ```
 
+## Transports: kernel (default) or DPDK kernel-bypass (opt-in)
+
+The proven core's entire input contract is a 1472-byte buffer, so it never names a socket —
+**transport lives wholly in the trusted shell, and swapping it re-discharges none of the 175 proof
+obligations.** Two are implemented:
+
+| | Build | Run |
+|---|---|---|
+| **Kernel** (default) | `./tools/build.sh` | *(nothing — it is the default)* |
+| **DPDK** (opt-in) | `WITH_DPDK=yes ./tools/build.sh` | `--with-dpdk --eal "<EAL args>"` |
+
+A default build is DPDK-free in the strict sense: it compiles no C, links no DPDK, and `nm` finds
+**zero `rte_*` symbols**. Passing `--with-dpdk` to such a binary exits 2 with *"built without DPDK
+support"* — you cannot get DPDK into the TCB by accident.
+
+On the DPDK path the LT packet rides **raw in an Ethernet frame** (EtherType `0x88B6`,
+14 + 1472 = 1486 ≤ 1500 MTU): no IP, no UDP, no fragmentation. `rte_eth_rx_burst` replaces
+`recvmmsg` and `rte_eth_tx_burst` replaces `Send_Socket`; `Handle`, `Lt_Wire.Parse`, the decoder and
+the checksum gate are byte-for-byte the same code.
+
+```sh
+WITH_DPDK=yes ./tools/build.sh     # needs libdpdk via pkg-config (DPDK_PREFIX=... or libdpdk-dev)
+./tools/dpdk-test.sh               # exercises the DPDK code path — no root, no hugepages, no NIC
+```
+
+### What that test proves, and what it does not
+
+`dpdk-test.sh` joins the two ends with the **memif** PMD — a *shared-memory pipe between two
+processes on one machine*. It is a real ethdev port, so it genuinely exercises EAL bring-up, the C
+shim, `rte_eth_rx_burst`/`rte_eth_tx_burst` and the raw-Ethernet framing, and it shows transfers
+decode byte-exact with the checksum gate intact. **But memif is not kernel bypass and does not cross
+a wire.** It needs no root precisely *because* it bypasses nothing.
+
+### Real kernel bypass (two physical machines) — the honest requirements
+
+> **Full step-by-step recipe: [`KERNEL-BYPASS.TXT`](KERNEL-BYPASS.TXT)** — IOMMU, hugepages, binding
+> a spare NIC, running non-root, and a troubleshooting section.
+
+| | Needs root? | Kernel bypassed? |
+|---|---|---|
+| `memif` (the test above) | no | **no** — shared memory, one machine |
+| `af_packet` (`--vdev=net_af_packet0,iface=eth0`) | no, with `setcap cap_net_raw,cap_net_admin+ep` | **no** — frames still traverse the kernel |
+| `vfio-pci` (true bypass) | **yes, for setup** | **yes** |
+
+True bypass needs, once, as root: an IOMMU (`intel_iommu=on`, BIOS + reboot), hugepages, and
+`dpdk-devbind.py -b vfio-pci <addr>` on a **spare** NIC — a bound NIC *disappears from the kernel*,
+so never bind the one carrying your SSH session. The *runtime* can then be non-root (chown
+`/dev/vfio/<group>`, a writable hugepage mount, a raised `RLIMIT_MEMLOCK`); without an IOMMU,
+`noiommu` mode needs `CAP_SYS_RAWIO` — effectively root, and genuinely unsafe (unrestricted DMA).
+
+**Also: the vendored DPDK in `../dpdk/deps` cannot do it at all.** It was built with
+`-Denable_drivers=bus/vdev,...,net/memif` — no PCI NIC PMD, and our binary links **zero PCI/VFIO
+symbols**. For two physical machines you need a DPDK carrying your NIC's PMD (Debian/Ubuntu:
+`apt install libdpdk-dev`, which ships e1000/ixgbe/i40e/mlx5/…), then rebuild with
+`DPDK_PREFIX` unset so the system `libdpdk.pc` is used.
+
+### Two physical machines, for real
+
+Both ends must share an L2 segment (same switch/VLAN, or a direct cable). Prefer wired: Wi-Fi and
+cloud virtual networks usually drop unknown-EtherType frames — and `0x88B6` is exactly that.
+
+**(a) `af_packet` — works today, no root at run time, but *not* bypass.** The NIC keeps its kernel
+driver, so SSH keeps working and nothing needs rebinding:
+
+```sh
+sudo setcap cap_net_raw,cap_net_admin+ep ./bin/receiver_stream ./bin/sender_stream   # once
+
+# receiver                                    # sender
+./bin/receiver_stream --with-dpdk \           ./bin/sender_stream --with-dpdk \
+  --eal "--no-huge --vdev=net_af_packet0,iface=eno1" \
+                                                --eal "--no-huge --vdev=net_af_packet0,iface=enp2s0" \
+  0 /var/spool/lt 1234 0                        0 0 1234 myfile 0 < myfile
+```
+
+Watch the frames from a third box: `sudo tcpdump -i eno1 ether proto 0x88b6`.
+
+**(b) `vfio-pci` — real kernel bypass.** Needs a **spare** NIC, an IOMMU and root for setup:
+
+```sh
+# once, as root, on each machine — NEVER the NIC carrying your SSH session
+echo 512 | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+sudo modprobe vfio-pci
+sudo dpdk-devbind.py --status-dev net              # find the spare NIC's PCI address
+sudo ip link set eno2 down
+sudo dpdk-devbind.py -b vfio-pci 0000:03:00.0      # it now vanishes from the kernel
+
+# then (no --vdev: the PCI port is probed; no --no-huge: use the hugepages)
+sudo ./bin/receiver_stream --with-dpdk --eal "-l 0" 0 /var/spool/lt 1234 0
+sudo ./bin/sender_stream   --with-dpdk --eal "-l 1" 0 0 1234 myfile 0 < myfile
+
+sudo dpdk-devbind.py -b e1000e 0000:03:00.0        # hand it back to the kernel
+```
+
+The `sudo` on the run lines can be dropped after chowning `/dev/vfio/<group>` to the user, making
+the hugepage mount writable, and raising `RLIMIT_MEMLOCK` — but the **setup** above is root, and
+without an IOMMU the `noiommu` fallback needs `CAP_SYS_RAWIO` (effectively root, and unsafe:
+unrestricted DMA). That privilege envelope is part of the DPDK trade, not separate from it.
+
+> **The trade, stated plainly.** DPDK moves its EAL, mempool and NIC PMD — a large third-party C
+> body — onto the data path *inside the TCB*, together with a small mandatory C shim (DPDK's burst
+> API is `static inline`, so there is no symbol for Ada to link against). Safety is unaffected: the
+> core is still proved, and the checksum gate still turns any mis-decode into a detected `.corrupt`.
+> What grows is what you must **trust**. The kernel path stays the assurance-maximal default.
+> The full ledger is [`docs/ASSURANCE.md` §5.1](docs/ASSURANCE.md).
+
 ### Sender
 
 ```sh

@@ -97,6 +97,46 @@ Append log lines to
 .BI \-\-log\-level " lvl"
 Minimum level:
 .BR debug ", " info " (default), " warn ", " error .
+.TP
+.B \-\-with\-dpdk
+Capture with DPDK poll-mode kernel bypass instead of a UDP socket.  Frames are
+raw Ethernet (EtherType
+.BR 0x88B6 ),
+so the
+.I port
+operand is ignored on this path.  Requires a binary built with
+.BR "WITH_DPDK=yes ./tools/build.sh" ;
+otherwise this exits 2 with a diagnostic.  See
+.B TRANSPORTS
+below.
+.TP
+.BI \-\-eal " args"
+EAL command line passed verbatim to DPDK, as one quoted argument, e.g.
+.RB \(dq "\-\-no\-huge \-l 0 \-\-vdev=net_memif0,role=server,socket=/tmp/s.sock,socket\-abstract=no" \(dq.
+Only meaningful with
+.BR \-\-with\-dpdk .
+.SH TRANSPORTS
+The proven codec core takes a 1472\-byte buffer and never names a socket, so the
+transport lives entirely in the trusted shell: selecting one does not re\-discharge
+any proof obligation.  Two are available.
+.TP
+.B kernel (default)
+.BR recvmmsg (2)
+batch drain of a UDP socket.  The trusted surface is a few kernel\-bounded
+syscalls.  This is the assurance\-maximal configuration.
+.TP
+.B DPDK (opt\-in)
+.BR rte_eth_rx_burst ()
+polling of a userspace poll\-mode driver.  This moves DPDK's EAL, mempool and NIC
+PMD \(em a large third\-party C body \(em plus a small mandatory C shim onto the data
+path, inside the trusted computing base.  Safety is unaffected (the core is still
+proved, and the checksum gate still marks any mis\-decode
+.BR .corrupt ),
+but what must be
+.I trusted
+grows.  Do not enable it unless you have accepted that trade; see
+.I docs/ASSURANCE.md
+\(sc5.1.
 .SH OPERANDS
 .I port spool SEED loss%
 may be given positionally or via the config file (\fBport\fR, \fBspool\fR,

@@ -1,0 +1,338 @@
+===============================================================================
+ KERNEL-BYPASS.TXT -- how to actually get DPDK kernel bypass with gnat-lt-pro
+===============================================================================
+
+ This document is the practical recipe.  For WHY you might not want to do this
+ at all -- what it costs you in trusted computing base -- read docs/ASSURANCE.md
+ section 5.1 first.  The short version is at the bottom of this file, under
+ "THE TRADE".
+
+ Everything here is about the OPTIONAL DPDK transport.  The default build of
+ this project does not contain DPDK at all and needs none of this.
+
+
+===============================================================================
+ 0. FIRST: THREE THINGS THAT ARE NOT KERNEL BYPASS
+===============================================================================
+
+ People say "DPDK" and mean three very different things.  Only the third is
+ kernel bypass.  Getting this wrong is the single most common confusion.
+
+   memif        A shared-memory pipe between two processes on ONE machine.
+                This is what tools/dpdk-test.sh uses.  It is a real DPDK
+                ethdev port, so it exercises all of our code -- but it does
+                not touch a NIC and does not cross a wire.
+                Needs no root, BECAUSE it bypasses nothing.
+                NOT KERNEL BYPASS.
+
+   af_packet    DPDK talking to a normal kernel network interface through an
+                AF_PACKET socket.  Works between two physical machines.  The
+                NIC keeps its kernel driver, SSH keeps working, no rebinding.
+                Needs CAP_NET_RAW (setcap), not root.
+                You get the DPDK API.  You do NOT get DPDK performance,
+                because every frame still goes through the kernel.
+                NOT KERNEL BYPASS.
+
+   vfio-pci     The NIC is detached from the kernel entirely and driven from
+                userspace.  Packets never enter the kernel network stack.
+                THIS is kernel bypass.  This is what the rest of this document
+                is about.  It needs root to set up, an IOMMU, hugepages, and a
+                SPARE network card.
+
+ If someone shows you a "DPDK works!" result, ask which of the three it was.
+
+
+===============================================================================
+ 1. WHAT YOU NEED BEFORE YOU START
+===============================================================================
+
+ 1.1  TWO PHYSICAL MACHINES on the same L2 segment.
+      Same switch, same VLAN, or a direct cable between them.
+
+      Prefer a direct cable or a dumb switch.  Wi-Fi will not work.  Cloud
+      networks (EC2 and friends) will not work: they drop frames with an
+      unknown EtherType, and we use 0x88B6.  Bridged local VMs do work.
+
+ 1.2  A SPARE NETWORK CARD on each machine.
+      Read this twice: a NIC bound to vfio-pci DISAPPEARS FROM THE KERNEL.
+      No IP address, no ifconfig, no SSH on it.  If you bind the card that
+      carries your SSH session, you lose the machine and need physical or
+      out-of-band access to recover it.
+
+      Check what you have:
+
+          ip -br link
+          sudo dpdk-devbind.py --status-dev net
+
+ 1.3  AN IOMMU.
+      Intel:  add  intel_iommu=on iommu=pt   to the kernel command line
+      AMD:    add  amd_iommu=on iommu=pt     to the kernel command line
+
+      Edit /etc/default/grub, line GRUB_CMDLINE_LINUX_DEFAULT, then:
+
+          sudo update-grub          # Debian/Ubuntu
+          sudo grub2-mkconfig -o /boot/grub2/grub.cfg    # SUSE/RHEL
+          sudo reboot
+
+      Verify after reboot -- this must print something:
+
+          dmesg | grep -i -e DMAR -e IOMMU
+          ls /sys/kernel/iommu_groups/         # must not be empty
+
+      IOMMU also usually has to be enabled in the BIOS/UEFI (look for
+      "VT-d", "Intel VT for Directed I/O", or "AMD-Vi" / "SR-IOV").
+
+      NO IOMMU?  There is a fallback, but understand what it is:
+
+          echo 1 | sudo tee /sys/module/vfio/parameters/enable_unsafe_noiommu_mode
+
+      In noiommu mode the card can DMA to ANY physical memory address, with
+      no hardware protection.  A buggy or hostile PMD can scribble anywhere
+      in RAM.  It also needs CAP_SYS_RAWIO, so you are effectively root.
+      Do not use it on a machine you care about.  It exists for lab VMs.
+
+ 1.4  A DPDK BUILD THAT CONTAINS YOUR NIC'S DRIVER.
+
+      *** The DPDK vendored in ../dpdk/deps CANNOT do kernel bypass. ***
+
+      It was deliberately built small, with virtual drivers only:
+
+          -Denable_drivers=bus/vdev,mempool/ring,net/af_packet,
+                           net/tap,net/null,net/ring,net/memif
+
+      No PCI NIC driver is in there, and our binary links zero PCI/VFIO
+      symbols.  It is fine for the memif test and for af_packet.  It is
+      useless for vfio-pci.
+
+      Use the distribution DPDK instead, which ships the real drivers
+      (e1000, ixgbe, i40e, ice, mlx5, virtio, ...):
+
+          sudo apt install build-essential pkg-config libdpdk-dev dpdk   # Debian/Ubuntu
+
+      Then build this project WITHOUT DPDK_PREFIX, so that pkg-config finds
+      the system libdpdk.pc rather than the vendored one:
+
+          unset DPDK_PREFIX
+          WITH_DPDK=yes ./tools/build.sh
+
+      Confirm you got a real driver in (this must be > 0):
+
+          nm bin/receiver_stream | grep -c rte_vfio_enable
+
+
+===============================================================================
+ 2. SET IT UP  (as root, once per machine, survives until reboot)
+===============================================================================
+
+ 2.1  Hugepages.  DPDK allocates its packet buffers from these.
+
+          echo 512 | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+
+      That is 512 x 2 MB = 1 GB.  Check it took:
+
+          grep Huge /proc/meminfo
+
+      To make it survive a reboot, add to /etc/sysctl.conf:
+
+          vm.nr_hugepages = 512
+
+ 2.2  Load the vfio-pci driver.
+
+          sudo modprobe vfio-pci
+
+ 2.3  Find the SPARE NIC's PCI address.
+
+          sudo dpdk-devbind.py --status-dev net
+
+      Output looks like:
+
+          0000:03:00.0 'I210 Gigabit Network Connection' if=eno2 drv=igb unused=vfio-pci
+          0000:02:00.0 'I219-LM'                          if=eno1 drv=e1000e unused=vfio-pci  *Active*
+
+      The one marked *Active* is almost certainly your SSH link.  DO NOT BIND
+      THAT ONE.  Here we take eno2 = 0000:03:00.0.
+
+ 2.4  Bind it to vfio-pci.
+
+          sudo ip link set eno2 down
+          sudo dpdk-devbind.py -b vfio-pci 0000:03:00.0
+
+      Confirm.  It should now appear under "Network devices using DPDK-compatible
+      driver" and have NO "if=" name:
+
+          sudo dpdk-devbind.py --status-dev net
+
+      The interface is now gone from `ip link`.  That is correct and expected.
+      That is what kernel bypass means.
+
+ 2.5  Repeat 2.1 - 2.4 on the SECOND machine.
+
+
+===============================================================================
+ 3. RUN IT
+===============================================================================
+
+ No --vdev this time: the PCI port is probed automatically.
+ No --no-huge either: we now have real hugepages, so let DPDK use them.
+
+ ON THE RECEIVER MACHINE:
+
+      sudo ./bin/receiver_stream --with-dpdk --eal "-l 0" \
+           0 /var/spool/lt-diode 1234 0
+
+      (The port operand -- the first 0 -- is ignored on the DPDK path.  There
+      are no UDP ports here; frames are raw Ethernet, EtherType 0x88B6.)
+
+ ON THE SENDER MACHINE:
+
+      sudo ./bin/sender_stream --with-dpdk --eal "-l 1" \
+           0 0 1234 myfile 0 < myfile
+
+      (IP and port -- the two 0s -- are likewise ignored.  Default destination
+      is broadcast, which is what a diode wants: the sender need not know the
+      receiver.  Use --dst aa:bb:cc:dd:ee:ff to unicast to one peer.)
+
+ THE SEED MUST MATCH ON BOTH SIDES (1234 above).  It selects the fountain-code
+ block sampling.  A mismatched seed decodes to garbage, which the checksum gate
+ will catch and mark .corrupt -- but you will have wasted the transfer.
+
+ Expected output on the receiver:
+
+      INFO [rs] listening on DPDK port 0 (kernel bypass, EtherType 0x88B6) ...
+
+ And when the transfer lands:
+
+      /var/spool/lt-diode/myfile            <- the data
+      /var/spool/lt-diode/myfile.finished   <- checksum verified, promoted
+      /var/spool/lt-diode/verify.log        <- verdict=ok
+
+
+===============================================================================
+ 4. GIVING THE NIC BACK TO THE KERNEL
+===============================================================================
+
+      sudo dpdk-devbind.py -b e1000e 0000:03:00.0      # or igb / ixgbe / i40e
+      sudo ip link set eno2 up
+
+ Use the driver name the card had originally -- the "drv=" field you saw in
+ step 2.3 before you bound it.  If you forget which, `lspci -k -s 03:00.0`
+ lists "Kernel modules:" for that device.
+
+
+===============================================================================
+ 5. RUNNING WITHOUT ROOT  (optional, after the root setup above)
+===============================================================================
+
+ The SETUP in section 2 is unavoidably root.  The RUNTIME does not have to be.
+ With a real IOMMU (not noiommu), do this once per boot:
+
+ 5.1  Find the IOMMU group of your bound NIC:
+
+          readlink -f /sys/bus/pci/devices/0000:03:00.0/iommu_group
+          # -> /sys/kernel/iommu_groups/17        (say)
+
+ 5.2  Give your user the vfio device nodes:
+
+          sudo chown "$USER" /dev/vfio/17 /dev/vfio/vfio
+
+      (A udev rule makes this permanent; a group like `vfio` is tidier than
+      chowning to a single user.)
+
+ 5.3  Make the hugepage mount writable by you:
+
+          sudo chmod 777 /dev/hugepages
+          # or mount -o uid=$USER ...
+
+ 5.4  Raise the locked-memory limit -- DPDK pins its hugepages:
+
+          ulimit -l unlimited       # needs a limits.conf entry to persist:
+          #   /etc/security/limits.conf:
+          #   yourname   -   memlock   unlimited
+
+ Then the run lines in section 3 work with no sudo.
+
+ WITHOUT an IOMMU (noiommu mode) this does NOT apply: you need CAP_SYS_RAWIO,
+ which is effectively root, and the card can DMA anywhere.  Non-root noiommu is
+ not a thing you should be trying to arrange.
+
+
+===============================================================================
+ 6. WHEN IT DOES NOT WORK
+===============================================================================
+
+ "no ethdev port available (did you pass --vdev=... or bind a NIC?)"
+      DPDK started but found no port.  Either the NIC is not bound to vfio-pci
+      (check dpdk-devbind.py --status-dev net), or your DPDK has no driver for
+      it -- which is exactly what happens with the vendored deps/ build.  See 1.4.
+
+ "EAL: Cannot init memory" / hugepage errors
+      No hugepages allocated (see 2.1), or another DPDK process already owns
+      them.  Give each process a distinct --file-prefix=NAME, or add -m 256 to
+      the EAL args to cap the memory it asks for.
+
+ "VFIO group is not viable" / "Device is in an IOMMU group with other devices"
+      The NIC shares an IOMMU group with devices still owned by the kernel.
+      All devices in a group must be bound together.  Often this means the NIC
+      is behind a PCI bridge shared with something else.  Try a different slot,
+      or (in a lab only) noiommu mode.
+
+ "Operation not permitted" on vfio
+      IOMMU not actually on (dmesg | grep -i DMAR), or you are non-root without
+      having done section 5.
+
+ "link is DOWN"
+      Cable, switch port, or the other end is not up yet.  The sender waits 5s
+      for link and then transmits anyway (a diode has no feedback), so a down
+      link just means the frames go nowhere.
+
+ Transfers arrive but land as .corrupt
+      Almost always a SEED MISMATCH between sender and receiver.  Check
+      verify.log: reason=checksum means the bytes decoded but did not match;
+      reason=decode means not enough packets got through.
+
+ Nothing arrives at all
+      Confirm the frames are physically on the wire.  From a third machine on
+      the same segment, or from the receiver on a kernel-driven NIC:
+
+          sudo tcpdump -i eno1 -XX ether proto 0x88b6
+
+      If tcpdump on the SENDER's segment sees nothing, the sender's port is not
+      transmitting.  If it sees frames but the receiver decodes nothing, the
+      receiver is on the wrong port or the wrong segment.
+
+
+===============================================================================
+ 7. THE TRADE  (read this before deciding to do any of the above)
+===============================================================================
+
+ This project's whole argument is a SMALL TRUSTED COMPUTING BASE:
+
+   - the codec core is machine-proved free of run-time errors (175 checks,
+     0 unproved, 0 justified), and
+   - everything unproved -- the I/O shell -- is small enough to enumerate,
+     review, race-check and stress-test.
+
+ Turning on DPDK moves a LARGE, UNAUDITED THIRD-PARTY C LIBRARY (the EAL, the
+ mempool, the NIC PMD) onto the data path, INSIDE that trusted computing base,
+ plus a small C shim we had to write because DPDK's packet-loop API is
+ static-inline and exports no symbols for Ada to link against.
+
+ And, as section 1.3 and section 2 make clear, it enlarges the PRIVILEGE and
+ HARDWARE-TRUST envelope too: root to set up, an IOMMU to be safe, and a card
+ doing DMA into your memory under the control of that unaudited driver.
+
+ What you get for it: the one thing the kernel path cannot give you -- no
+ "kernel could not drain the socket fast enough" packet loss under a flood.
+ It improves WHETHER A TRANSFER COMPLETES.
+
+ What you do NOT lose: correctness.  The proven core is unchanged, and the
+ whole-stream checksum gate still refuses to promote a bad decode -- a fault
+ anywhere in DPDK yields a detected .corrupt, never a .finished file with wrong
+ bytes.  Integrity fails closed on both transports.
+
+ So: use the kernel path by default.  Reach for DPDK when you have measured
+ real packet loss on a real link, on a machine where you accept the trade, and
+ write down in your deployment notes WHICH TRANSPORT IS IN USE -- because the
+ size of what you are trusting differs between them.
+
+===============================================================================

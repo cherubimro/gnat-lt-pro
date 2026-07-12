@@ -6,7 +6,32 @@
 --  (added in later phases) is trusted Ada.  See README.md for the layering.
 project Lt_Diode is
 
-   for Source_Dirs use ("src/codec", "src", "tests");
+   --  Optional DPDK poll-mode transport (kernel bypass).  Default OFF: a plain
+   --  build compiles no C, links no DPDK, and keeps the trusted shell exactly
+   --  as docs/ASSURANCE.md §5 describes it.  Turn it on with
+   --
+   --     WITH_DPDK=yes ./tools/build.sh          (see tools/build.sh)
+   --
+   --  which also exports DPDK_CFLAGS / DPDK_LIBS from `pkg-config libdpdk`.
+   --  The proven core is identical either way -- only the trusted shell's
+   --  transport changes (docs/ASSURANCE.md §5.1).
+   type Yes_No is ("no", "yes");
+   With_Dpdk : Yes_No := external ("WITH_DPDK", "no");
+
+   Common_Dirs := ("src/codec", "src", "src/net", "tests");
+
+   case With_Dpdk is
+      when "yes" =>
+         --  Real bindings + the C shim (DPDK's data path is static inline, so
+         --  a C translation unit is unavoidable -- see the shim's header).
+         for Source_Dirs use Common_Dirs & ("src/net/dpdk");
+         for Languages   use ("Ada", "C");
+      when "no" =>
+         --  Stub body: Available = False.  No DPDK anywhere in the build.
+         for Source_Dirs use Common_Dirs & ("src/net/stub");
+         for Languages   use ("Ada");
+   end case;
+
    for Object_Dir  use "obj";
    for Exec_Dir    use "bin";
    for Main        use ("test_codec.adb", "sender_stream.adb",
@@ -21,11 +46,36 @@ project Lt_Diode is
       --  the byte-XOR hot path.  Standard range/overflow checks stay on.
       for Default_Switches ("Ada") use
         ("-g", "-O2", "-gnat2022", "-gnatwa");
+
+      --  The DPDK shim.  DPDK_CFLAGS comes from `pkg-config --cflags libdpdk`
+      --  and carries the include path plus the mandatory `-include rte_config.h`.
+      case With_Dpdk is
+         when "yes" =>
+            for Default_Switches ("C") use
+              ("-O2", "-g", "-Wall", "-Wextra")
+              & external_as_list ("DPDK_CFLAGS", " ");
+         when "no" =>
+            null;
+      end case;
    end Compiler;
 
    package Builder is
       for Default_Switches ("Ada") use ("-j0");
    end Builder;
+
+   package Linker is
+      --  DPDK_LIBS must come from `pkg-config --STATIC --libs libdpdk`: the
+      --  --whole-archive it emits is load-bearing, not cosmetic.  Without it
+      --  the PMD constructors are never pulled in from the archives, nothing
+      --  self-registers, and the app starts with zero ports.
+      case With_Dpdk is
+         when "yes" =>
+            for Default_Switches ("Ada") use
+              external_as_list ("DPDK_LIBS", " ");
+         when "no" =>
+            null;
+      end case;
+   end Linker;
 
    package Prove is
       --  Analyse only the proven core; the shell will carry SPARK_Mode => Off.

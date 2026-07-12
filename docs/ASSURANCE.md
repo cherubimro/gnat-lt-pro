@@ -155,7 +155,7 @@ The trusted side is justified by four independent means:
    that let stale slots accumulate under load. The capture loop now has a
    **defence-in-depth handler so no single datagram can take it down**.
 
-### 5.1 Transport is a trusted-shell choice — and DPDK would be a TCB trade
+### 5.1 Transport is a trusted-shell choice — and DPDK is a TCB trade
 
 Transport lives **entirely below the boundary of §2**. The proven core's whole
 input contract is a 1472-byte buffer (`Lt_Wire.Packet_Buffer`, filled by
@@ -166,27 +166,35 @@ replaced without touching — and without re-discharging — a single one of the
 proof obligations.** The boundary, the `Valid` obligation (§4.3), the integrity
 gate (§6) and determinism (§4.6) are all transport-invariant.
 
-Two transports are in scope. Only the first is implemented today; this
-subsection records the analysis for the second **before** it is built, so its
-cost is on paper rather than discovered later.
+Two transports are implemented. Which one a binary can even *use* is fixed at
+**build** time; which one it *does* use is chosen at **run** time:
 
-- **Kernel path (current default).** `GNAT.Sockets` UDP send on the sender; a
-  `recvmmsg` batch drain on the receiver (`receiver_stream.adb:867`), the
-  hand-bound `mmsghdr` ABI guarded by an `Object_Size` check. The trusted
-  surface this adds is exactly the §5 table: a few syscalls the kernel itself
-  bounds, reached through small reviewed C bindings. This is the
-  **assurance-maximal** configuration and remains the default.
-- **DPDK path (optional, evaluated, not implemented).** A userspace poll-mode
-  driver would fill the same 1472-byte buffer from `rte_eth_rx_burst` instead of
-  `recvmmsg`, and transmit with `rte_eth_tx_burst` instead of `Send_Socket`.
-  Structurally this is a near-identity swap: the RX loop is already batch-shaped,
-  `Handle` / `Parse` / the decoder / the gate are unchanged, and the shell
-  already binds C by hand — so DPDK is the *same technique*, not a new one. A
-  one-way diode is DPDK's ideal case (blast TX, promiscuous poll RX, no
-  connection state), and the 1472-byte packet rides in a raw Ethernet payload
-  (14 + 1472 = 1486 ≤ 1500 MTU) with no fragmentation.
+| | Build | Run |
+|---|---|---|
+| Kernel (default) | `./tools/build.sh` | *(nothing — it is the default)* |
+| DPDK (opt-in) | `WITH_DPDK=yes ./tools/build.sh` | `--with-dpdk --eal "<EAL args>"` |
 
-**A C shim would be mandatory, not a convenience.** DPDK's data-path API is not
+A default build is **DPDK-free in the strict sense**: `WITH_DPDK=no` selects a
+stub body (`src/net/stub/lt_dpdk.adb`), compiles no C, links no DPDK, and
+`nm` finds **zero `rte_*` symbols** in the binary. `--with-dpdk` on such a
+binary does not misbehave — it exits 2 with *"built without DPDK support"*.
+The opt-in is therefore real: you cannot get DPDK into the TCB by accident.
+
+- **Kernel path (default).** `GNAT.Sockets` UDP send on the sender; a `recvmmsg`
+  batch drain on the receiver, the hand-bound `mmsghdr` ABI guarded by an
+  `Object_Size` check. The trusted surface is exactly the §5 table: a few
+  syscalls the kernel itself bounds, reached through small reviewed C bindings.
+  This is the **assurance-maximal** configuration and remains the default.
+- **DPDK path (opt-in).** A userspace poll-mode driver fills the same 1472-byte
+  buffer from `rte_eth_rx_burst` instead of `recvmmsg`, and transmits with
+  `rte_eth_tx_burst` instead of `Send_Socket`. It is a near-identity swap: the
+  RX loop was already batch-shaped, and `Handle` / `Lt_Wire.Parse` / the decoder
+  / the checksum gate are **byte-for-byte the same code**. A one-way diode is
+  DPDK's ideal case (blast TX, promiscuous poll RX, no connection state), and
+  the 1472-byte packet rides raw in an Ethernet payload — 14 + 1472 = 1486 ≤ 1500
+  MTU, EtherType `0x88B6` — with no IP, no UDP, and no fragmentation.
+
+**The C shim is mandatory, not a convenience.** DPDK's data-path API is not
 linkable from Ada: `rte_eth_rx_burst`, `rte_eth_tx_burst` and the `rte_pktmbuf_*`
 accessors are `static inline` in the headers (DPDK inlines the burst path
 deliberately — that is where its performance comes from), and `nm` confirms
@@ -194,16 +202,34 @@ deliberately — that is where its performance comes from), and `nm` confirms
 `rte_eth_dev_configure`, `rte_eth_*_queue_setup`, `rte_eth_dev_start`) are real
 symbols that bind directly. So `Import, Convention => C` reaches the port
 bring-up but **cannot reach the packet loop**: there is no symbol to resolve.
-The DPDK backend therefore necessarily adds a small C translation unit (~60–80
-lines) exposing non-inline wrappers — `lt_dpdk_rx_burst` / `lt_dpdk_tx_burst` /
-`lt_dpdk_mtod` / `lt_dpdk_free` — which Ada imports exactly as it imports
+The backend therefore carries a small C translation unit,
+`src/net/dpdk/lt_dpdk_shim.c` (~200 lines with its commentary), exposing
+non-inline wrappers — `lt_dpdk_rx_burst` / `lt_dpdk_tx` / `lt_dpdk_init` /
+`lt_dpdk_wait_link` / `lt_dpdk_fini` — which Ada imports exactly as it imports
 `recvmmsg` today. This is the same hand-bound-C technique already in the shell
-(§5), and the shim is small enough to review line by line; but it is **a new C
-file on the data path inside the TCB**, and the assurance ledger must say so
-rather than treat the binding as free. `gprbuild` compiles it (`for Languages use
-("Ada", "C")`); the DPDK flags come from `pkg-config libdpdk` — `--static --libs`
-is required, not cosmetic, since it emits `--whole-archive` and without it the
-PMD constructors never self-register and no port appears at run time.
+(§5); but it is **a new C file on the data path inside the TCB**, and the ledger
+says so rather than treating the binding as free.
+
+Two properties keep that shim reviewable, and they are the reason it is written
+the way it is:
+
+1. **mbuf lifetime never escapes C.** RX *copies* whole LT packets out into the
+   caller's buffer and frees every mbuf it was handed; TX allocates, fills,
+   transmits, and frees on refusal. Ada therefore never holds a DPDK pointer and
+   **cannot leak, double-free, or use-after-free one** — the classic DPDK defect
+   class is structurally absent from the Ada side. The price is one 1472-byte
+   `memcpy` per packet, which is nothing next to the kernel copy it replaces.
+2. **The shim filters, so Ada's contract is unchanged.** Frames with the wrong
+   EtherType or too short are dropped in C, so buffers `1 .. Count` are exactly
+   the full-length candidates — the *same* contract the kernel path gets from its
+   `Len = Max_Buf_Len` test. The capture loop's defence-in-depth exception
+   handler wraps `Handle` on both paths identically.
+
+`gprbuild` compiles the shim (`for Languages use ("Ada", "C")`); the flags come
+from `pkg-config libdpdk`. `--static --libs` is load-bearing, not cosmetic: it
+emits `--whole-archive`, and without it the PMD constructors are never pulled
+out of the archives, nothing self-registers, and the binary starts with zero
+ports.
 
 The reason DPDK is **not** the default, and must be a deliberate opt-in, is the
 trusted computing base:
@@ -235,8 +261,45 @@ decode margin. DPDK thus improves *whether a transfer completes*, at a cost paid
 entirely in *what must be trusted for it to complete* — never in *whether a
 completed transfer is correct*.
 
-**Posture.** If the DPDK transport is built, it is a build-time / config-selected
-backend behind the §2 buffer boundary, **not** a replacement. The kernel path
+**Evidence that the swap is behaviour-preserving — and the exact limits of that
+evidence.** `tools/dpdk-test.sh` runs the whole stack through the DPDK code path
+and asserts that transfers decode **byte-exact** and that the **checksum gate is
+still the gate** (`verdict=ok` in `verify.log`). It does so by joining the two
+ends with DPDK's `memif` PMD, which needs no root, no hugepages and no NIC.
+
+That evidence must not be oversold, so state its boundary plainly:
+
+- **What it establishes.** `memif` is a real ethdev port, so EAL bring-up, the C
+  shim, `rte_eth_rx_burst` / `rte_eth_tx_burst`, the mbuf discipline and the
+  raw-Ethernet framing are all genuinely exercised, and the core + gate behave
+  identically to the kernel path.
+- **What it does NOT establish.** `memif` is a *shared-memory pipe between two
+  processes on one machine*. **It is not kernel bypass and it does not cross a
+  wire.** It requires no privilege precisely *because* it bypasses nothing. No
+  claim about NIC-level bypass, line-rate throughput, or two-machine operation is
+  supported by this test.
+
+**Real bypass has a privilege cost that the assurance case must not hide.** True
+`vfio-pci` operation requires, as **root**, once: an IOMMU (`intel_iommu=on`,
+BIOS + reboot), hugepages, and binding a **spare** NIC away from the kernel
+(a bound NIC *vanishes* from the kernel — never the one carrying SSH). The
+run-time process can then be unprivileged (`/dev/vfio/<group>` chowned, a
+writable hugepage mount, a raised `RLIMIT_MEMLOCK`), but without an IOMMU the
+`noiommu` fallback needs `CAP_SYS_RAWIO` — effectively root, and genuinely
+unsafe, since the device can then DMA anywhere in memory. **A DPDK deployment
+therefore enlarges not only the TCB but the privilege and hardware-trust
+envelope**, and that belongs in this ledger next to the code-size argument.
+(`af_packet` needs only `CAP_NET_RAW` and no IOMMU — but it is *not* bypass:
+frames still traverse the kernel. It buys the DPDK API, not DPDK performance.)
+The operational recipe, with its prerequisites stated in full, is
+[`KERNEL-BYPASS.TXT`](../KERNEL-BYPASS.TXT).
+
+Meanwhile `tools/check.sh` and `tools/stress-test.sh` still pass unchanged on the
+default build — the proof is still **175 checks, 0 unproved, 0 justified** —
+because nothing the DPDK work touched is inside the proven core.
+
+**Posture.** The DPDK transport is a build-time-enabled, run-time-selected
+backend behind the §2 buffer boundary — **not** a replacement. The kernel path
 stays the default for assurance-sensitive deployments; the DPDK path is the
 throughput option for a controlled link whose operator has explicitly accepted
 DPDK in the TCB. The proof covers both identically — but this document, and any
@@ -283,6 +346,10 @@ deliberate forgery by an attacker who also rewrites the trailer.)
 ./tools/prove.sh          # gnatprove: 175 checks, 0 unproved, 0 justified
 ./tools/check.sh          # build + proof + in-memory matrix + end-to-end + loopback
 ./tools/stress-test.sh    # adversarial soak of the trusted shell (16 checks)
+
+# The optional DPDK transport (§5.1) -- off unless you ask for it:
+WITH_DPDK=yes ./tools/build.sh
+./tools/dpdk-test.sh      # kernel bypass end-to-end, no root / hugepages / NIC
 ```
 
 The assurance case is the composition of all three: **a proof that the

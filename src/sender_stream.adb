@@ -17,6 +17,7 @@ with Lt_Encoder;
 with Lt_Checksum;
 with Lt_Wire;
 with Lt_Log;
+with Lt_Dpdk;
 
 --  Zero-temp streaming LT sender: reads the payload from stdin, emits an LT
 --  fountain stream over UDP, and never seeks or spools the input.  Coding is
@@ -51,6 +52,13 @@ procedure Sender_Stream is
    Progress : Boolean := False;
    Sock     : Socket_Type;
 
+   --  Transport selection (docs/ASSURANCE.md §5.1).  Default: the kernel path.
+   --  --with-dpdk swaps only how a serialized packet leaves the process; the
+   --  encoder, the sampler and the wire format above are untouched.
+   Use_Dpdk : Boolean := False;
+   Eal_Args : Unbounded_String := Null_Unbounded_String;
+   Dst_Mac  : Unbounded_String := Null_Unbounded_String;
+
    Log_Dest  : Lt_Log.Dest_Type  := Lt_Log.To_Stderr;
    Log_File  : Unbounded_String  := Null_Unbounded_String;
    Log_Level : Lt_Log.Level_Type := Lt_Log.Info;
@@ -63,14 +71,24 @@ procedure Sender_Stream is
    Pace_Batch : constant := 128;
 
    ---------------------------------------------------------------------------
-   --  UDP send (connected datagram socket).  On a one-way diode there is no
-   --  return path, so a transient socket error is treated as "delivered".
+   --  Send one packet.  Either a UDP datagram (connected socket, kernel path)
+   --  or a raw Ethernet frame via DPDK (kernel bypass).  On a one-way diode
+   --  there is no return path, so a transient send error is treated as
+   --  "delivered" -- and the fountain code is built to tolerate the loss.
    ---------------------------------------------------------------------------
    procedure Send_Buf (Buf : Lt_Wire.Packet_Buffer) is
-      Data : constant Wire_SEA := To_SEA (Buf);
-      Last : Ada.Streams.Stream_Element_Offset;
    begin
-      Send_Socket (Sock, Data, Last);
+      if Use_Dpdk then
+         Lt_Dpdk.Tx (Buf);
+      else
+         declare
+            Data : constant Wire_SEA := To_SEA (Buf);
+            Last : Ada.Streams.Stream_Element_Offset;
+         begin
+            Send_Socket (Sock, Data, Last);
+         end;
+      end if;
+
       if Pace_Us > 0 then
          Pace_Cnt := Pace_Cnt + 1;
          if Pace_Cnt >= Pace_Batch then
@@ -195,6 +213,18 @@ begin
                   Ignore := Lt_Log.Parse_Level (Argument (Argi), Log_Level);
                end;
             end if;
+         elsif F = "--with-dpdk" then
+            Use_Dpdk := True;
+         elsif F = "--eal" then
+            Argi := Argi + 1;
+            if Argi <= Argument_Count then
+               Eal_Args := To_Unbounded_String (Argument (Argi));
+            end if;
+         elsif F = "--dst" then
+            Argi := Argi + 1;
+            if Argi <= Argument_Count then
+               Dst_Mac := To_Unbounded_String (Argument (Argi));
+            end if;
          else
             exit;
          end if;
@@ -252,21 +282,61 @@ begin
          N_Coding := Natural (Recv_Tgt / (1.0 - L));
       end;
 
-      --  Connect the datagram socket.
-      begin
-         Create_Socket (Sock, Family_Inet, Socket_Datagram);
-         Connect_Socket
-           (Sock,
-            (Family => Family_Inet,
-             Addr   => Inet_Addr (A_IP),
-             Port   => Port_Type (Natural'Value (A_Port))));
-      exception
-         when others => Die ("cannot open/connect UDP socket to "
-                             & A_IP & ":" & A_Port);
-      end;
+      if Use_Dpdk then
+         --  Kernel bypass: bring up the EAL and an ethdev port.  <IP> and
+         --  <port> are ignored on this path -- frames go out as raw Ethernet
+         --  (EtherType 0x88B6), broadcast unless --dst names a peer.
+         if not Lt_Dpdk.Available then
+            Die ("--with-dpdk given, but this binary was built without DPDK"
+                 & " support.  Rebuild:  WITH_DPDK=yes ./tools/build.sh");
+         end if;
+         declare
+            Ok : Boolean;
+         begin
+            Lt_Dpdk.Init (To_String (Eal_Args), Ok);
+            if not Ok then
+               Die ("DPDK init failed (EAL args: """
+                    & To_String (Eal_Args) & """)");
+            end if;
+            if Dst_Mac /= Null_Unbounded_String then
+               Lt_Dpdk.Set_Dst (To_String (Dst_Mac), Ok);
+               if not Ok then
+                  Die ("bad --dst MAC: " & To_String (Dst_Mac));
+               end if;
+            end if;
+
+            --  Peers (memif, af_packet) connect asynchronously; frames blasted
+            --  at a down link are dropped outright.  Wait, but do not insist:
+            --  a diode has no feedback, so we transmit regardless and let the
+            --  fountain code absorb whatever the link did not carry.
+            Lt_Dpdk.Wait_Link (5_000, Ok);
+            if not Ok then
+               Lt_Log.Log (Lt_Log.Warn,
+                 "DPDK link still down after 5s -- sending anyway");
+            end if;
+         end;
+      else
+         --  Connect the datagram socket.
+         begin
+            Create_Socket (Sock, Family_Inet, Socket_Datagram);
+            Connect_Socket
+              (Sock,
+               (Family => Family_Inet,
+                Addr   => Inet_Addr (A_IP),
+                Port   => Port_Type (Natural'Value (A_Port))));
+         exception
+            when others => Die ("cannot open/connect UDP socket to "
+                                & A_IP & ":" & A_Port);
+         end;
+      end if;
 
       Lt_Log.Log (Lt_Log.Info,
-        A_Name & " -> " & A_IP & ":" & A_Port
+        A_Name & " -> "
+        & (if Use_Dpdk
+           then "DPDK port 0 (kernel bypass, EtherType 0x88B6, dst "
+                & (if Dst_Mac = Null_Unbounded_String then "broadcast"
+                   else To_String (Dst_Mac)) & ")"
+           else A_IP & ":" & A_Port)
         & "  seed=" & A_Seed & "  loss=" & A_Loss & "%  coding/group="
         & N_Coding'Image);
 
@@ -311,6 +381,16 @@ begin
       Lt_Log.Log (Lt_Log.Info,
         "done:" & Group_No'Image & " groups,"
         & Unsigned_64'Image (Total_Bytes) & " bytes.");
-      Close_Socket (Sock);
+
+      if Use_Dpdk then
+         --  Let the driver drain before we tear the port down.  On a shared-
+         --  memory PMD (memif) the peer polls a ring we would otherwise stop
+         --  under it, and the EOT trailer is the one packet we cannot afford
+         --  to lose -- without it the receiver never finalises the transfer.
+         delay 1.0;
+         Lt_Dpdk.Fini;
+      else
+         Close_Socket (Sock);
+      end if;
    end;
 end Sender_Stream;
