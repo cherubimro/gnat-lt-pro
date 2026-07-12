@@ -155,6 +155,74 @@ The trusted side is justified by four independent means:
    that let stale slots accumulate under load. The capture loop now has a
    **defence-in-depth handler so no single datagram can take it down**.
 
+### 5.1 Transport is a trusted-shell choice — and DPDK would be a TCB trade
+
+Transport lives **entirely below the boundary of §2**. The proven core's whole
+input contract is a 1472-byte buffer (`Lt_Wire.Packet_Buffer`, filled by
+`Parse`, produced by `Serialize`); it never names a socket, an address family,
+or a syscall. *Which* mechanism fills that buffer is a property of the trusted
+shell alone. This has a sharp assurance consequence: **the transport can be
+replaced without touching — and without re-discharging — a single one of the 175
+proof obligations.** The boundary, the `Valid` obligation (§4.3), the integrity
+gate (§6) and determinism (§4.6) are all transport-invariant.
+
+Two transports are in scope. Only the first is implemented today; this
+subsection records the analysis for the second **before** it is built, so its
+cost is on paper rather than discovered later.
+
+- **Kernel path (current default).** `GNAT.Sockets` UDP send on the sender; a
+  `recvmmsg` batch drain on the receiver (`receiver_stream.adb:867`), the
+  hand-bound `mmsghdr` ABI guarded by an `Object_Size` check. The trusted
+  surface this adds is exactly the §5 table: a few syscalls the kernel itself
+  bounds, reached through small reviewed C bindings. This is the
+  **assurance-maximal** configuration and remains the default.
+- **DPDK path (optional, evaluated, not implemented).** A userspace poll-mode
+  driver would fill the same 1472-byte buffer from `rte_eth_rx_burst` instead of
+  `recvmmsg`, and transmit with `rte_eth_tx_burst` instead of `Send_Socket`.
+  Structurally this is a near-identity swap: the RX loop is already batch-shaped,
+  `Handle` / `Parse` / the decoder / the gate are unchanged, and the shell
+  already binds C by hand — so DPDK is the *same technique*, not a new one. A
+  one-way diode is DPDK's ideal case (blast TX, promiscuous poll RX, no
+  connection state), and the 1472-byte packet rides in a raw Ethernet payload
+  (14 + 1472 = 1486 ≤ 1500 MTU) with no fragmentation.
+
+The reason DPDK is **not** the default, and must be a deliberate opt-in, is the
+trusted computing base:
+
+| | Kernel path | DPDK path |
+|---|---|---|
+| In-process unproven C on the data path | small reviewed bindings (§5 table) | **DPDK EAL + mempool + the NIC PMD** — a large third-party C body |
+| Who bounds a hostile datagram first | the kernel network stack, then `Handle` | the PMD, then `Handle` |
+| Memory | kernel socket buffers | hugepages + mbuf pools; alloc/free discipline moves into the shell |
+| Threading | the Ada capture/decode tasks | a pinned DPDK lcore feeding the existing decode task |
+| Privilege / setup | a UDP port | `vfio-pci` bind of a **spare** NIC, an IOMMU, hugepages |
+
+DPDK does not weaken the **safety** claim: the core is still proved AoRTE, and
+the checksum gate still turns any mis-decode — including one caused by a PMD
+fault or a dropped frame — into a detected `.corrupt`, never a `.finished`. What
+it changes is the **trusted** side of the ledger. The project's thesis is a
+small, enumerable trusted shell (§5: "the table above is the whole of it");
+adding DPDK trades that for throughput by moving a large, unaudited C library
+into the process, on the data path, inside the TCB. **That is a real assurance
+regression, and it is recorded here as one — not amortized into a footnote.**
+
+The trade is worth *offering* because it buys the one property the kernel path
+cannot: it attacks the availability residual risk of §7 head-on. A dedicated
+poll core with large RX descriptor rings does not suffer the "kernel cannot
+drain the socket fast enough under a flood" loss that otherwise forces a raised
+`net.core.rmem_max`; fewer dropped frames means fewer groups falling below the
+decode margin. DPDK thus improves *whether a transfer completes*, at a cost paid
+entirely in *what must be trusted for it to complete* — never in *whether a
+completed transfer is correct*.
+
+**Posture.** If the DPDK transport is built, it is a build-time / config-selected
+backend behind the §2 buffer boundary, **not** a replacement. The kernel path
+stays the default for assurance-sensitive deployments; the DPDK path is the
+throughput option for a controlled link whose operator has explicitly accepted
+DPDK in the TCB. The proof covers both identically — but this document, and any
+deployment note, **must state which transport is in use, because the size of the
+TCB differs between them.**
+
 ## 6. The integrity gate — safe degradation
 
 The strongest part of the argument is that a fault in the *trusted* shell cannot
@@ -183,7 +251,8 @@ deliberate forgery by an attacker who also rewrites the trailer.)
   fall below the decode margin. This affects *whether* a transfer completes, not
   *whether* a completed transfer is correct. Mitigation: `recvmmsg` batching, a
   large `SO_RCVBUF` request, and sender pacing; a raised `rmem_max` on a real
-  deployment (documented in `receiver_stream(1)`).
+  deployment (documented in `receiver_stream(1)`); and, at the TCB cost recorded
+  in §5.1, an optional userspace poll-mode (DPDK) transport.
 - **Hand-bound ABI and the `syslog` varargs binding** are outside the language
   model. Mitigation: the `mmsghdr` layout is size-checked at start-up; the
   bindings are small and reviewed.
