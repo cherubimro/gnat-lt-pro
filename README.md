@@ -275,7 +275,8 @@ How the harder obligations were closed:
 
 ## Attribution & license
 
-Ada/SPARK port of **[lt-diode-pro](https://github.com/cherubimro/lt-diode-pro)** (Politehnica
-University Timisoara), itself a fork of **melorian94/robust-soliton-LT-C** by Petra — the LT /
-robust-soliton core, the feedback-free one-way design and the three-port UDP scheme are hers. As a
-derivative of an **AGPL-3.0** work, this port is likewise **GNU AGPL-3.0**.
+Ada/SPARK port by **Alin-Adrian Anton** (alin.anton@upt.ro), Politehnica University of Timișoara,
+of **[lt-diode-pro](https://github.com/cherubimro/lt-diode-pro)**, itself a fork of
+**melorian94/robust-soliton-LT-C** by Petra — the LT / robust-soliton core, the feedback-free
+one-way design and the three-port UDP scheme are hers. As a derivative of an **AGPL-3.0** work,
+this port is likewise **GNU AGPL-3.0**. See [`AUTHORS`](AUTHORS) for details.
