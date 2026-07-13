@@ -1,0 +1,13 @@
+gnat-lt-pro — AUTHORS
+
+Author of the Ada/SPARK port:
+  Alin-Adrian Anton  <alin.anton@upt.ro>
+  Politehnica University of Timișoara
+
+Upstream / original work:
+  Petra (melorian94) — robust-soliton-LT-C: the LT / robust-soliton core,
+  the feedback-free one-way design, and the three-port UDP scheme.
+  https://github.com/cherubimro/lt-diode-pro (lt-diode-pro)
+
+This project is a derivative of an AGPL-3.0 work and is likewise licensed
+under the GNU AGPL-3.0.
