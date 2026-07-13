@@ -1,5 +1,9 @@
 # gnat-lt-pro
 
+*Made 🄯 libre (free as in freedom) with ❤️ at Politehnica University of Timișoara — quite possibly the first formally-verified (machine-checked proof of no run-time errors), fountain-coded data-diode transport for protecting critical infrastructures such as power grids, water treatment plants, oil & gas pipelines, railways, and telecommunications networks.*
+
+*Because we care — and because critical-infrastructure protection should not depend on proprietary / closed-source systems, and should be made FREE.*
+
 **A high-assurance Ada/SPARK port of [lt-diode-pro](https://github.com/cherubimro/lt-diode-pro)** —
 a rateless **LT (Luby Transform) fountain-code transport for one-way data diodes**.
 
