@@ -1,3 +1,7 @@
+--  gnat-lt-pro — a formally-verified, fountain-coded data-diode transport.
+--  Copyright (C) 2026  Alin-Adrian Anton <alin.anton@upt.ro>
+--  SPDX-License-Identifier: AGPL-3.0-or-later
+
 pragma SPARK_Mode (Off);   --  trusted: I/O, syslog binding, tasking-safe emit
 
 --  Small shared, thread-safe operational logger (mirrors the C reference's

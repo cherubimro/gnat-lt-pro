@@ -1,3 +1,7 @@
+--  gnat-lt-pro — a formally-verified, fountain-coded data-diode transport.
+--  Copyright (C) 2026  Alin-Adrian Anton <alin.anton@upt.ro>
+--  SPDX-License-Identifier: AGPL-3.0-or-later
+
 --  Lt_Dpdk -- optional DPDK poll-mode transport (kernel bypass).
 --
 --  This is TRUSTED shell, not proven core: SPARK_Mode is Off throughout.  See

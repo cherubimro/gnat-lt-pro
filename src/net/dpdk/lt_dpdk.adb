@@ -1,3 +1,7 @@
+--  gnat-lt-pro — a formally-verified, fountain-coded data-diode transport.
+--  Copyright (C) 2026  Alin-Adrian Anton <alin.anton@upt.ro>
+--  SPDX-License-Identifier: AGPL-3.0-or-later
+
 --  Lt_Dpdk -- REAL body, used when WITH_DPDK=yes.
 --
 --  Thin Ada bindings to lt_dpdk_shim.c.  Every import here is a real symbol in
